@@ -21,9 +21,35 @@ declenche que sur **echec net**, pas sur timeout.
 
 ## Le patch
 
-Les hostnames Gameloft sont remplaces par des noms en `.invalid`
-(RFC 6761 : ne resolvent jamais), en preservant strictement la longueur
-de chaque chaine — aucun offset du Mach-O n'est decale.
+### Patch principal (issu du desassemblage arm64)
+
+Le blocage sur « Telechargement du profil » est un ecran nomme
+`UI_DOWNLOADING_PROFILE`. Le desassemblage montre qu'il n'a **qu'un seul
+site d'emission** dans tout le binaire : dans la boucle d'update, un
+predicat partage (`sub_100346c10`, "faut-il telecharger le profil ?")
+decide entre afficher ce spinner ou emettre l'etat natif `UI_FIRST_CHECK`
+(« pas de profil a telecharger, on continue ») :
+
+```
+bl   sub_100346c10        ; predicat "download profile ?"
+cbz  w0, UI_FIRST_CHECK    ; ==0 -> on continue
+...  UI_DOWNLOADING_PROFILE ; !=0 -> spinner infini (serveur mort)
+```
+
+Le predicat renvoie « oui » tant que le login en ligne est actif, mais le
+serveur Gameloft est mort : il ne se termine jamais, donc le spinner reste.
+Le patch remplace ce `bl` (au **seul** site concerne, pas la fonction
+partagee appelee ~50 fois ailleurs) par `mov w0, #0`. Le `cbz` est alors
+toujours pris : le jeu route vers `UI_FIRST_CHECK` et poursuit hors-ligne.
+4 octets, longueur preservee. Auto-localise via la reference unique a la
+chaine, donc robuste.
+
+### Patchs complementaires
+
+Les hostnames Gameloft morts sont remplaces par des noms en `.invalid`
+(RFC 6761 : ne resolvent jamais), plus la neutralisation des chemins et de
+la fonction de detection jailbreak — tout a longueur strictement preservee,
+aucun offset du Mach-O n'est decale.
 
 | Host neutralise            | Role                        |
 |----------------------------|-----------------------------|
@@ -32,8 +58,6 @@ de chaque chaine — aucun offset du Mach-O n'est decale.
 | pjsmmm-legacy.gameloft.com | backend legacy              |
 | ingameads.gameloft.com     | pub / iphoneloading.php     |
 | 201205igp.gameloft.com     | IGP / freemium              |
-
-20 chaines patchees (10 par slice, armv7 + arm64).
 
 ## Le binaire
 

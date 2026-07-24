@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-Patch TASM2 (1.3.1) : neutralise les hosts Gameloft morts pour forcer
-le fallback offline et permettre la sauvegarde locale (ud_Spider2.sav).
+Patch TASM2 (1.3.1) : debloque l'ecran "Telechargement du profil"
+(UI_DOWNLOADING_PROFILE) pour permettre le jeu offline.
 
-Remplace les hostnames par des noms en .invalid (RFC 6761 : ne resolvent
-jamais) en preservant strictement la longueur de chaque chaine, donc
-aucun offset du Mach-O n'est decale.
+Le patch principal (issu du desassemblage arm64, pas d'une hypothese) :
+neutralise la DECISION "faut-il telecharger le profil en ligne" au seul
+site d'appel concerne, pour router le jeu vers son etat natif UI_FIRST_CHECK
+("pas de profil a telecharger") au lieu du spinner infini.
+
+Patchs complementaires historiques (hosts Gameloft morts -> .invalid,
+chemins et fonction de detection jailbreak). Tout est fait a longueur
+strictement preservee : aucun offset du Mach-O n'est decale.
 """
 import re
 import struct
@@ -24,8 +29,6 @@ HOSTS = [
 ]
 
 # Chemins de detection de jailbreak (obfusques dans le binaire).
-# LiveContainer declenche ces checks -> prevent_start_if_jailbroken
-# -> blocage volontaire sur UI_DOWNLOADING_PROFILE.
 JB_PATHS = [
     b"/Ljbrbrz/MpbjlfSvbstrbtf/MobileSubstrate.dylib",
     b"/Applications/Czdjb.bpp",
@@ -37,7 +40,7 @@ JB_PATHS = [
 
 
 def info_macho(data):
-    """Retourne la liste des slices (label, offset, filetype)."""
+    """Retourne la liste des slices (label, offset, size, filetype)."""
     out = []
     magic = struct.unpack(">I", data[:4])[0]
     if magic != 0xCAFEBABE:
@@ -51,6 +54,101 @@ def info_macho(data):
     return out
 
 
+def arm64_slice_off(data):
+    """Offset (dans le FAT) du slice arm64, ou None."""
+    for label, off, size, ft in info_macho(data):
+        if label == "arm64":
+            return off, size
+    return None, None
+
+
+def arm64_sections(data, base):
+    """Retourne {sectname: (vmaddr, fileoff, size)} pour le slice arm64 @ base."""
+    out = {}
+    ncmds = struct.unpack("<I", data[base + 16:base + 20])[0]
+    p = base + 32
+    for _ in range(ncmds):
+        cmd, csize = struct.unpack("<II", data[p:p + 8])
+        if cmd == 0x19:  # LC_SEGMENT_64
+            nsects = struct.unpack("<I", data[p + 64:p + 68])[0]
+            q = p + 72
+            for _s in range(nsects):
+                sectname = data[q:q + 16].split(b"\x00")[0].decode()
+                addr, size = struct.unpack("<QQ", data[q + 32:q + 48])
+                offset = struct.unpack("<I", data[q + 48:q + 52])[0]
+                out[sectname] = (addr, base + offset, size)
+                q += 80
+        p += csize
+    return out
+
+
+def patch_profile_skip(m):
+    """
+    Patch principal : au site d'appel qui, juste avant d'afficher
+    UI_DOWNLOADING_PROFILE, appelle le predicat "download profile ?"
+    (BL 0x100346c10), on remplace ce BL par `mov w0, #0`. Le `cbz w0`
+    qui suit est alors toujours pris -> le jeu emet UI_FIRST_CHECK
+    (chemin natif "pas de profil a telecharger") et poursuit la boucle.
+
+    Auto-localise via la reference unique a la chaine UI_DOWNLOADING_PROFILE,
+    donc robuste. Renvoie (ok, file_off) ou (False, None).
+    """
+    base, size = arm64_slice_off(m)
+    if base is None:
+        return False, None
+    sects = arm64_sections(m, base)
+    if "__cstring" not in sects or "__text" not in sects:
+        return False, None
+    cs_addr, cs_off, cs_size = sects["__cstring"]
+    tx_addr, tx_off, tx_size = sects["__text"]
+
+    # 1) adresse virtuelle de la chaine
+    blob = m[cs_off:cs_off + cs_size]
+    i = blob.find(b"UI_DOWNLOADING_PROFILE\x00")
+    if i < 0 or (i != 0 and blob[i - 1] != 0):
+        return False, None
+    sva = cs_addr + i
+
+    # 2) scanner __text pour l'ADRP+ADD formant sva
+    text = m[tx_off:tx_off + tx_size]
+    n = tx_size // 4
+    insns = struct.unpack_from("<%dI" % n, text, 0)
+    regpage = {}
+    add_addr = None
+    for k in range(n):
+        insn = insns[k]
+        pc = tx_addr + k * 4
+        if (insn & 0x9F000000) == 0x90000000:  # ADRP
+            immlo = (insn >> 29) & 3
+            immhi = (insn >> 5) & 0x7FFFF
+            imm = (immhi << 2 | immlo)
+            if imm & (1 << 20):
+                imm -= (1 << 21)
+            regpage[insn & 0x1F] = (pc & ~0xFFF) + (imm << 12)
+        elif (insn & 0xFF000000) == 0x91000000:  # ADD imm
+            rn = (insn >> 5) & 0x1F
+            if rn in regpage:
+                imm = (insn >> 10) & 0xFFF
+                if (insn >> 22) & 1:
+                    imm <<= 12
+                if regpage[rn] + imm == sva:
+                    add_addr = pc
+                    break
+    if add_addr is None:
+        return False, None
+
+    # 3) le BL predicat est 0x24 avant l'ADD ; verifier que c'est bien un BL
+    call_pc = add_addr - 0x24
+    call_off = tx_off + (call_pc - tx_addr)
+    old = struct.unpack("<I", m[call_off:call_off + 4])[0]
+    if (old & 0xFC000000) != 0x94000000:  # pas un BL -> on n'ecrit rien
+        return False, None
+
+    # 4) mov w0, #0
+    m[call_off:call_off + 4] = struct.pack("<I", 0x52800000)
+    return True, call_off
+
+
 def patcher(data):
     m = bytearray(data)
     patches = []
@@ -60,7 +158,6 @@ def patcher(data):
         off = mt.start()
         if b"gameloft.com" not in s:
             continue
-        # ignorer les chemins de build et les placeholders
         if b"/Users/gameloft" in s or b"<your_gl" in s:
             continue
         new = s
@@ -76,7 +173,7 @@ def patcher(data):
     for off, s, new in patches:
         m[off:off + len(s)] = new
 
-    # --- detection de jailbreak ---
+    # --- chemins de detection de jailbreak ---
     jb = []
     for p in JB_PATHS:
         i = 0
@@ -92,19 +189,18 @@ def patcher(data):
             i += 1
 
     # --- fonction de detection de jailbreak (arm64) ---
-    # 0x1003e2b3c : enchaine 6 stat() sur des chemins JB puis un fork(),
-    # retourne 1 si l'appareil est considere compromis.
-    # Patch : mov w0, #0 ; ret  -> retourne toujours "propre".
     JB_FUNC_FILEOFF = 19016508
-    JB_FUNC_ORIG = bytes.fromhex("ff0303d1f44f0aa9")  # sub sp,#0xc0 ; stp x20,x19
+    JB_FUNC_ORIG = bytes.fromhex("ff0303d1f44f0aa9")
     JB_FUNC_PATCH = struct.pack("<II", 0x52800000, 0xD65F03C0)  # mov w0,#0 ; ret
-
     fn_ok = False
     if m[JB_FUNC_FILEOFF:JB_FUNC_FILEOFF + 8] == JB_FUNC_ORIG:
         m[JB_FUNC_FILEOFF:JB_FUNC_FILEOFF + 8] = JB_FUNC_PATCH
         fn_ok = True
 
-    return bytes(m), patches, jb, fn_ok
+    # --- PATCH PRINCIPAL : skip du telechargement de profil ---
+    skip_ok, skip_off = patch_profile_skip(m)
+
+    return bytes(m), patches, jb, fn_ok, skip_ok, skip_off
 
 
 def main():
@@ -129,7 +225,14 @@ def main():
         nom = {2: "MH_EXECUTE", 6: "MH_DYLIB"}.get(ft, str(ft))
         print(f"  {label:6} off={off:<10} size={size:<10} filetype={nom}")
 
-    out, patches, jb, fn_ok = patcher(data)
+    out, patches, jb, fn_ok, skip_ok, skip_off = patcher(data)
+
+    if skip_ok:
+        print(f"\n>>> PATCH PRINCIPAL applique: skip UI_DOWNLOADING_PROFILE "
+              f"-> UI_FIRST_CHECK (site d'appel @ file_off {skip_off}, mov w0,#0)")
+    else:
+        print("\n>>> ERREUR: patch principal (skip profil) NON applique "
+              "(site d'appel introuvable) -- le blocage ne sera pas leve")
 
     print(f"\n{len(jb)} chemins de detection jailbreak neutralises")
     if fn_ok:
@@ -145,15 +248,20 @@ def main():
         print("ERREUR: taille modifiee, abandon")
         return 1
 
-    # verification: plus aucun host actif
     restants = re.findall(rb"https?://[a-z0-9.-]*gameloft\.com", out)
     if restants:
         print(f"ERREUR: {len(restants)} hosts gameloft encore actifs")
         return 1
 
+    if not skip_ok:
+        # le patch principal est la raison d'etre de cette version : on refuse
+        # de produire un binaire qui ne debloque rien.
+        print("ERREUR: patch principal absent, abandon")
+        return 1
+
     open(sys.argv[2], "wb").write(out)
     print(f"\nOK -> {sys.argv[2]} ({len(out)} octets)")
-    print("Aucun host gameloft actif restant.")
+    print("Aucun host gameloft actif restant. Profil: skip -> UI_FIRST_CHECK.")
     return 0
 
 
