@@ -1,8 +1,13 @@
 # Patch TASM2 — bypass serveurs Gameloft
 
 Automatise le patch de **The Amazing Spider-Man 2 (1.3.1, iOS)** pour
-neutraliser les appels aux serveurs Gameloft morts et forcer le mode
-offline, ce qui debloque la sauvegarde locale.
+neutraliser les appels aux serveurs Gameloft morts et permettre de lancer
+et jouer au jeu hors-ligne.
+
+**Portee** : le jeu se lance et se joue. La progression de l'histoire n'est
+en revanche **pas conservee** entre deux lancements — voir la section
+« Sauvegarde locale : impossible par patch », conclusions verifiees sur
+appareil.
 
 ## Le probleme
 
@@ -59,27 +64,50 @@ aucun offset du Mach-O n'est decale.
 | ingameads.gameloft.com     | pub / iphoneloading.php     |
 | 201205igp.gameloft.com     | IGP / freemium              |
 
-### Piste ecartee : forcer l'autosave (a ne pas refaire)
+### Sauvegarde locale : impossible par patch (conclusions, testees sur appareil)
 
-Tentative : neutraliser (`nop`) le gate "dirty" du writer de `ud_Spider2.sav`
-pour forcer l'ecriture. **Resultat : regression, blocage a 45 % au chargement.**
+Trois tentatives, toutes infirmees par des tests reels. Resume pour ne pas
+les refaire :
 
-Le desassemblage explique pourquoi :
-- le writer fait deux choses : ecrire les objets `ud_*.sav` (**non throttle**)
-  puis, seulement toutes les ~20 s (timer), ecrire `ud_Spider2.sav` ;
-- le gate "dirty" protegeait les deux. Sans lui, la premiere partie tourne
-  a chaque frame -> tempete d'I/O pendant le chargement ;
-- pire, la branche "skip" (dirty==0) est aussi ce qui **re-arme** le flag
-  `+0xfa9` ; en la supprimant, le "mark dirty" est bloque definitivement.
+**v1 — forcer l'autosave** (`nop` du gate "dirty" du writer). Regression :
+blocage a 45 % au chargement. Le writer ecrit les `ud_*.sav` **sans throttle**
+(seul `ud_Spider2.sav` a un timer 20 s) ; sans le gate il tourne a chaque
+frame -> tempete d'I/O. La branche "skip" supprimee etait en plus le
+**re-armement** du flag `+0xfa9`, ce qui bloquait definitivement le mark-dirty.
 
-Sauter directement a la section timer ne marche pas non plus : le `fwrite`
-final ecrit un buffer de pile (~2 Ko, `fwrite(sp+0xf8, 0x7bf, ...)`) qui est
-rempli dans la partie gatee — on ecrirait un save invalide.
+**v2 — forcer le flag dirty au flush evenementiel.** Fonctionne pour
+l'ecriture (fichier bien mis a jour), mais sans effet : rien ne relit la
+progression.
 
-Constat utile pour la suite : le forcage **ecrit bien** tous les objets
-(`ud_Economy.sav`, `ud_Item.sav`, `ud_FriendList.sav` apparaissent), donc la
-serialisation fonctionne ; c'est le *declenchement* qu'il faut traiter, sans
-faire tourner le writer pendant le chargement.
+**v3 — persister les 17 objets** (`nop` du filtre `ldrb [x22,#0x25]`).
+Aucun fichier supplementaire n'apparait : ce drapeau n'est pas le verrou.
+
+**Pourquoi c'est un mur.** `ud_Spider2.sav` est du **code mort**. Son writer
+fait :
+
+```
+sprintf(buf, "%s/ud_Spider2.sav", docs)   ; buf recoit le CHEMIN
+fopen(...) ; rand()                        ; cle aleatoire, jamais stockee
+XOR(buf, key ^ index) ; fwrite(buf, 0x7bf) ; on ecrit ce meme buf
+```
+
+Verifie sur un fichier reel de 1983 octets recupere sur appareil : avec la
+cle deduite (`0xff`), le contenu dechiffre commence par
+`/var/mobile/Containers/Data/Application/<UUID>/Documents/...` — le chemin
+lui-meme — puis 47 % de zeros et des restes de pile. **Aucune donnee de jeu.**
+Et la chaine `%s/ud_Spider2.sav` n'est referencee qu'une fois dans tout le
+binaire : par ce writer. Aucun lecteur n'existe.
+
+La vraie persistance locale (`ud_<Nom>.sav`, lecture `0x100211a2c` / ecriture
+`0x1002115f0`, symetriques) ne couvre que **Sound, Control, InitPos, Economy,
+Item, FriendList** — reglages et inventaire. La progression de l'histoire
+n'y figure pas : elle vivait dans le profil serveur, ce que le jeu affiche
+lui-meme (« Connecte-toi en ligne juste une fois pour recuperer ta derniere
+sauvegarde »).
+
+Conclusion : restaurer la progression demanderait d'**ecrire** un systeme de
+sauvegarde (serialisation + deserialisation injectees dans le binaire), pas
+de deverrouiller du code existant. Hors de portee d'un patch d'octets.
 
 ## Le binaire
 
@@ -88,7 +116,8 @@ faire tourner le writer pendant le chargement.
 - SDK iphoneos10.3 / Xcode 8.3 (build 2017), MinimumOSVersion 8.0
 - SHA1 original : `b3d322a788bbeeb1a006ba0da23a28300a5b7105`
 - Taille : 33 375 152 octets (inchangee apres patch)
-- Sauvegarde locale : `ud_Spider2.sav` (userdata / skill / goods / SaveIndex)
+- `ud_Spider2.sav` : **code mort** (buffer de pile brouille par `rand()`, jamais relu)
+- Persistance locale reelle : `ud_<Nom>.sav` — reglages et inventaire uniquement
 
 ## Usage
 
@@ -128,11 +157,12 @@ sans manipulation de fichier et de facon reversible.
 
 ## Statut
 
-Le patch repose sur une analyse **statique** du binaire. Les domaines et
-le fallback offline sont confirmes dans le code, mais rien n'a ete execute :
-que le fallback se declenche reellement sur echec DNS reste a verifier sur
-appareil.
+**Verifie sur appareil** (LiveContainer, iOS) :
+- le blocage sur « Telechargement du profil » est leve, le jeu se lance et
+  se joue hors-ligne ;
+- la progression n'est pas conservee entre deux lancements, et ce n'est pas
+  un verrou a contourner : le code de sauvegarde de la progression locale
+  n'existe pas dans ce binaire.
 
-Si le jeu boucle toujours apres patch, le blocage est plus profond que la
-couche hostname et il faudra patcher le flot de controle autour de
-`COnlineManager`.
+Les patchs hosts/jailbreak sont conserves ; seul le patch profil est
+necessaire au deblocage.
