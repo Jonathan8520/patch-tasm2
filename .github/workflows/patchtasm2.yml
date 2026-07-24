@@ -1,0 +1,100 @@
+name: Patch TASM2 IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "URL directe de l'IPA (archive.org)"
+        required: true
+        default: "https://archive.org/download/the_amazing_spider_man_2_v1_3_1_ipa_1.3.1_ios_8.0/The_Amazing_Spider_Man_2_v1_3_1_ipa_1.3.1_ios_8.0.ipa"
+      release_tag:
+        description: "Tag de la Release qui contiendra l'IPA patchee"
+        required: false
+        default: "patched-latest"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Espace disque disponible
+        run: df -h /
+
+      - name: Telecharger l'IPA
+        run: |
+          echo "Telechargement depuis ${{ github.event.inputs.ipa_url }}"
+          curl -L --fail --retry 3 --retry-delay 5 \
+               -o original.ipa \
+               "${{ github.event.inputs.ipa_url }}"
+          ls -la original.ipa
+          echo "sha1: $(sha1sum original.ipa | cut -d' ' -f1)"
+
+      - name: Extraire
+        run: |
+          mkdir -p work
+          unzip -q original.ipa -d work
+          echo "--- structure ---"
+          ls work/
+          ls work/Payload/
+          APP=$(ls -d work/Payload/*.app | head -1)
+          echo "APP=$APP" >> $GITHUB_ENV
+          echo "bundle: $APP"
+          ls -la "$APP/AmazingSpiderMan2"
+
+      - name: Patcher le binaire
+        run: |
+          python3 patch_tasm2.py \
+            "$APP/AmazingSpiderMan2" \
+            AmazingSpiderMan2_patched
+          # remplacer en preservant les permissions d'execution
+          cp AmazingSpiderMan2_patched "$APP/AmazingSpiderMan2"
+          chmod 755 "$APP/AmazingSpiderMan2"
+          ls -la "$APP/AmazingSpiderMan2"
+
+      - name: Supprimer la signature
+        run: |
+          rm -rf "$APP/_CodeSignature"
+          rm -f "$APP/embedded.mobileprovision"
+          echo "signature supprimee"
+          ls "$APP/" | head -20
+
+      - name: Reconstruire l'IPA
+        run: |
+          cd work
+          # zipper le dossier Payload lui-meme, pas son contenu
+          zip -qr ../SpiderMan2_patched.ipa Payload
+          cd ..
+          ls -la SpiderMan2_patched.ipa
+          echo "--- verification racine de l'archive ---"
+          unzip -l SpiderMan2_patched.ipa | head -8
+
+      - name: Verifier le resultat
+        run: |
+          mkdir -p verif
+          unzip -qo SpiderMan2_patched.ipa -d verif
+          BIN="verif/Payload/$(ls verif/Payload | head -1)/AmazingSpiderMan2"
+          echo "taille: $(stat -c%s "$BIN") (attendu 33375152)"
+          echo "--- hosts gameloft restants (doit etre vide) ---"
+          strings "$BIN" | grep -E 'https?://[a-z0-9.-]*gameloft\.com' || echo "aucun : OK"
+          echo "--- hosts .invalid injectes ---"
+          strings "$BIN" | grep -c 'invalid' || true
+
+      - name: Publier l'IPA dans une Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag }}
+          name: "TASM2 patched (${{ github.event.inputs.release_tag }})"
+          body: |
+            The Amazing Spider-Man 2 (1.3.1) — binaire patche pour neutraliser
+            les hosts Gameloft morts et forcer le mode offline.
+
+            - Signature supprimee (a resigner via LiveContainer / SideStore / Sideloadly)
+            - Genere par le workflow `Patch TASM2 IPA` (run #${{ github.run_number }})
+          files: SpiderMan2_patched.ipa
+          fail_on_unmatched_files: true
