@@ -149,6 +149,86 @@ def patch_profile_skip(m):
     return True, call_off
 
 
+def patch_force_autosave(m):
+    """
+    Patch sauvegarde locale : le writer d'`ud_Spider2.sav` (progression) ne
+    serialise/ecrit que si un flag "dirty" (saveMgr+0xfa8) est pose. Hors-ligne
+    ce flag n'est plus mis (progression jadis committee via le profil serveur),
+    donc la progression n'est plus sauvegardee. On neutralise le gate :
+    `cbz w9, <skip>` -> `nop`, pour que l'autosave ecrive la progression
+    courante a chaque cycle (~20s), independamment du flag.
+
+    Auto-localise via la chaine "%s/ud_Spider2.sav" -> fonction writer ->
+    triplet `ldr x?,[x?,#0xfa8] ; and w?,w?,#0xff ; cbz w?,<skip>`.
+    Renvoie (ok, file_off) ou (False, None).
+    """
+    base, size = arm64_slice_off(m)
+    if base is None:
+        return False, None
+    sects = arm64_sections(m, base)
+    if "__cstring" not in sects or "__text" not in sects:
+        return False, None
+    cs_addr, cs_off, cs_size = sects["__cstring"]
+    tx_addr, tx_off, tx_size = sects["__text"]
+
+    blob = m[cs_off:cs_off + cs_size]
+    i = blob.find(b"%s/ud_Spider2.sav\x00")
+    if i < 0:
+        return False, None
+    sva = cs_addr + i
+
+    text = m[tx_off:tx_off + tx_size]
+    n = tx_size // 4
+    insns = struct.unpack_from("<%dI" % n, text, 0)
+    regpage = {}
+    add_pc = None
+    for k in range(n):
+        insn = insns[k]
+        pc = tx_addr + k * 4
+        if (insn & 0x9F000000) == 0x90000000:
+            immlo = (insn >> 29) & 3
+            immhi = (insn >> 5) & 0x7FFFF
+            imm = (immhi << 2 | immlo)
+            if imm & (1 << 20):
+                imm -= (1 << 21)
+            regpage[insn & 0x1F] = (pc & ~0xFFF) + (imm << 12)
+        elif (insn & 0xFF000000) == 0x91000000:
+            rn = (insn >> 5) & 0x1F
+            if rn in regpage:
+                im = (insn >> 10) & 0xFFF
+                if (insn >> 22) & 1:
+                    im <<= 12
+                if regpage[rn] + im == sva:
+                    add_pc = pc
+                    break
+    if add_pc is None:
+        return False, None
+
+    # debut de fonction : remonter jusqu'au RET precedent
+    RET = 0xD65F03C0
+    a = add_pc
+    while a > tx_addr and struct.unpack_from("<I", text, a - 4 - tx_addr)[0] != RET:
+        a -= 4
+    fstart = a
+
+    # triplet ldr[#0xfa8] ; and #0xff ; cbz
+    cbz_pc = None
+    for pc in range(fstart, fstart + 0x100, 4):
+        w = struct.unpack_from("<I", text, pc - tx_addr)[0]
+        if (w & 0xFFC00000) == 0xF9400000 and ((w >> 10) & 0xFFF) == 0x1F5:
+            w2 = struct.unpack_from("<I", text, pc + 4 - tx_addr)[0]
+            w3 = struct.unpack_from("<I", text, pc + 8 - tx_addr)[0]
+            if (w2 & 0x7F800000) == 0x12000000 and (w3 & 0x7F000000) == 0x34000000:
+                cbz_pc = pc + 8
+                break
+    if cbz_pc is None:
+        return False, None
+
+    cbz_off = tx_off + (cbz_pc - tx_addr)
+    m[cbz_off:cbz_off + 4] = struct.pack("<I", 0xD503201F)  # NOP
+    return True, cbz_off
+
+
 def patcher(data):
     m = bytearray(data)
     patches = []
@@ -200,7 +280,10 @@ def patcher(data):
     # --- PATCH PRINCIPAL : skip du telechargement de profil ---
     skip_ok, skip_off = patch_profile_skip(m)
 
-    return bytes(m), patches, jb, fn_ok, skip_ok, skip_off
+    # --- PATCH SAUVEGARDE : force l'autosave de la progression ---
+    save_ok, save_off = patch_force_autosave(m)
+
+    return bytes(m), patches, jb, fn_ok, skip_ok, skip_off, save_ok, save_off
 
 
 def main():
@@ -225,7 +308,7 @@ def main():
         nom = {2: "MH_EXECUTE", 6: "MH_DYLIB"}.get(ft, str(ft))
         print(f"  {label:6} off={off:<10} size={size:<10} filetype={nom}")
 
-    out, patches, jb, fn_ok, skip_ok, skip_off = patcher(data)
+    out, patches, jb, fn_ok, skip_ok, skip_off, save_ok, save_off = patcher(data)
 
     if skip_ok:
         print(f"\n>>> PATCH PRINCIPAL applique: skip UI_DOWNLOADING_PROFILE "
@@ -233,6 +316,12 @@ def main():
     else:
         print("\n>>> ERREUR: patch principal (skip profil) NON applique "
               "(site d'appel introuvable) -- le blocage ne sera pas leve")
+
+    if save_ok:
+        print(f">>> PATCH SAUVEGARDE applique: autosave progression force "
+              f"(gate dirty @ file_off {save_off} -> nop)")
+    else:
+        print(">>> ATTENTION: patch sauvegarde NON applique (gate introuvable)")
 
     print(f"\n{len(jb)} chemins de detection jailbreak neutralises")
     if fn_ok:

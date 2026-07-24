@@ -44,6 +44,24 @@ toujours pris : le jeu route vers `UI_FIRST_CHECK` et poursuit hors-ligne.
 4 octets, longueur preservee. Auto-localise via la reference unique a la
 chaine, donc robuste.
 
+### Patch sauvegarde locale (autosave progression)
+
+La progression est ecrite dans `ud_Spider2.sav` par un autosave, mais
+seulement si un flag "dirty" (`saveMgr+0xfa8`) est pose. Ce flag n'etait
+committe qu'au travers du profil serveur : hors-ligne il ne l'est plus,
+donc la progression n'etait plus sauvegardee (le fichier existe mais reste
+fige). Le writer saute alors serialisation **et** ecriture :
+
+```
+ldr  x8, [x19, #0xfa8]    ; flag dirty
+and  w9, w8, #0xff
+cbz  w9, <skip tout>      ; dirty==0 -> rien n'est ecrit
+```
+
+Le patch remplace ce `cbz` par `nop` : l'autosave ecrit la progression
+courante a chaque cycle (~20 s), independamment du flag. 4 octets, longueur
+preservee, auto-localise via la chaine `%s/ud_Spider2.sav`.
+
 ### Patchs complementaires
 
 Les hostnames Gameloft morts sont remplaces par des noms en `.invalid`
