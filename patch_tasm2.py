@@ -149,6 +149,126 @@ def patch_profile_skip(m):
     return True, call_off
 
 
+def patch_save_on_flush(m):
+    """
+    Patch sauvegarde locale (v2, evenementiel).
+
+    Le flag "dirty" du save-manager n'est cable qu'au flux UI_HardReset :
+    en jeu, la progression n'etait committee qu'au travers du profil serveur
+    (mort) -> plus rien n'est sauvegarde en local.
+
+    On NE touche PAS au writer (v1 forcait l'ecriture a chaque frame ->
+    tempete d'I/O -> blocage a 45 %). On agit sur le "flush save" event-driven,
+    reconnaissable a son double appel du writer avec dt=0 :
+
+        ldr x0, [x21, #0x560]   ; save manager
+        mov w1, #0              ; dt = 0
+        bl  writer              ; <- 1er appel (redondant)
+        ldr x0, [x21, #0x560]
+        mov w1, #0
+        bl  writer              ; <- 2e appel
+
+    Le 1er appel est remplace par la pose du flag dirty, de sorte que le 2e
+    appel (inchange) effectue reellement la sauvegarde :
+
+        mov  w8, #1
+        strb w8, [x0, #0xfa8]   ; dirty = 1
+
+    Cette fonction n'est pas la boucle par frame (celle-ci appelle le writer
+    avec le vrai dt), donc pas d'I/O par frame. 8 octets, longueur preservee.
+    Renvoie (ok, file_off) ou (False, None).
+    """
+    base, size = arm64_slice_off(m)
+    if base is None:
+        return False, None
+    sects = arm64_sections(m, base)
+    if "__cstring" not in sects or "__text" not in sects:
+        return False, None
+    cs_addr, cs_off, cs_size = sects["__cstring"]
+    tx_addr, tx_off, tx_size = sects["__text"]
+
+    # 1) localiser le writer via la chaine "%s/ud_Spider2.sav"
+    blob = m[cs_off:cs_off + cs_size]
+    i = blob.find(b"%s/ud_Spider2.sav\x00")
+    if i < 0:
+        return False, None
+    sva = cs_addr + i
+
+    text = m[tx_off:tx_off + tx_size]
+    n = tx_size // 4
+    insns = struct.unpack_from("<%dI" % n, text, 0)
+    regpage = {}
+    add_pc = None
+    for k in range(n):
+        insn = insns[k]
+        pc = tx_addr + k * 4
+        if (insn & 0x9F000000) == 0x90000000:
+            immlo = (insn >> 29) & 3
+            immhi = (insn >> 5) & 0x7FFFF
+            imm = (immhi << 2 | immlo)
+            if imm & (1 << 20):
+                imm -= (1 << 21)
+            regpage[insn & 0x1F] = (pc & ~0xFFF) + (imm << 12)
+        elif (insn & 0xFF000000) == 0x91000000:
+            rn = (insn >> 5) & 0x1F
+            if rn in regpage:
+                im = (insn >> 10) & 0xFFF
+                if (insn >> 22) & 1:
+                    im <<= 12
+                if regpage[rn] + im == sva:
+                    add_pc = pc
+                    break
+    if add_pc is None:
+        return False, None
+
+    # le writer commence apres le RET precedent ; quelques `b` de thunk peuvent
+    # trainer avant le vrai prologue, donc on accepte une cible dans la plage
+    # [debut_bloc .. ref_chaine].
+    RET = 0xD65F03C0
+    a = add_pc
+    while a > tx_addr and struct.unpack_from("<I", text, a - 4 - tx_addr)[0] != RET:
+        a -= 4
+    lo, hi = a, add_pc
+
+    # 2) trouver le double appel writer(dt=0) : BL a X et X+0xC, meme cible,
+    #    chacun precede de `mov w1, #0`
+    MOV_W1_0 = 0x52800001
+    site = None
+    for k in range(1, n - 3):
+        insn = insns[k]
+        if (insn & 0xFC000000) != 0x94000000:
+            continue
+        pc = tx_addr + k * 4
+        off = insn & 0x03FFFFFF
+        if off & (1 << 25):
+            off -= (1 << 26)
+        tgt = pc + off * 4
+        if not (lo <= tgt <= hi):
+            continue
+        insn2 = insns[k + 3]
+        if (insn2 & 0xFC000000) != 0x94000000:
+            continue
+        off2 = insn2 & 0x03FFFFFF
+        if off2 & (1 << 25):
+            off2 -= (1 << 26)
+        if (pc + 0xC) + off2 * 4 != tgt:   # les deux appels visent le meme writer
+            continue
+        # les deux appels doivent etre precedes de `mov w1, #0`
+        if insns[k - 1] != MOV_W1_0 or insns[k + 2] != MOV_W1_0:
+            continue
+        site = pc
+        break
+    if site is None:
+        return False, None
+
+    # 3) `mov w1,#0` -> `mov w8,#1` ; `bl writer` -> `strb w8,[x0,#0xfa8]`
+    off_mov = tx_off + (site - 4 - tx_addr)
+    off_bl = tx_off + (site - tx_addr)
+    m[off_mov:off_mov + 4] = struct.pack("<I", 0x52800028)   # mov  w8, #1
+    m[off_bl:off_bl + 4] = struct.pack("<I", 0x393EA008)     # strb w8, [x0, #0xfa8]
+    return True, off_mov
+
+
 def patcher(data):
     m = bytearray(data)
     patches = []
@@ -200,7 +320,10 @@ def patcher(data):
     # --- PATCH PRINCIPAL : skip du telechargement de profil ---
     skip_ok, skip_off = patch_profile_skip(m)
 
-    return bytes(m), patches, jb, fn_ok, skip_ok, skip_off
+    # --- PATCH SAUVEGARDE (v2) : sauvegarde locale au flush evenementiel ---
+    save_ok, save_off = patch_save_on_flush(m)
+
+    return bytes(m), patches, jb, fn_ok, skip_ok, skip_off, save_ok, save_off
 
 
 def main():
@@ -225,7 +348,7 @@ def main():
         nom = {2: "MH_EXECUTE", 6: "MH_DYLIB"}.get(ft, str(ft))
         print(f"  {label:6} off={off:<10} size={size:<10} filetype={nom}")
 
-    out, patches, jb, fn_ok, skip_ok, skip_off = patcher(data)
+    out, patches, jb, fn_ok, skip_ok, skip_off, save_ok, save_off = patcher(data)
 
     if skip_ok:
         print(f"\n>>> PATCH PRINCIPAL applique: skip UI_DOWNLOADING_PROFILE "
@@ -233,6 +356,12 @@ def main():
     else:
         print("\n>>> ERREUR: patch principal (skip profil) NON applique "
               "(site d'appel introuvable) -- le blocage ne sera pas leve")
+
+    if save_ok:
+        print(f">>> PATCH SAUVEGARDE (v2) applique: dirty force au flush "
+              f"evenementiel (@ file_off {save_off})")
+    else:
+        print(">>> ATTENTION: patch sauvegarde v2 NON applique (site introuvable)")
 
     print(f"\n{len(jb)} chemins de detection jailbreak neutralises")
     if fn_ok:
