@@ -91,7 +91,20 @@ def patcher(data):
             jb.append((i, p))
             i += 1
 
-    return bytes(m), patches, jb
+    # --- fonction de detection de jailbreak (arm64) ---
+    # 0x1003e2b3c : enchaine 6 stat() sur des chemins JB puis un fork(),
+    # retourne 1 si l'appareil est considere compromis.
+    # Patch : mov w0, #0 ; ret  -> retourne toujours "propre".
+    JB_FUNC_FILEOFF = 19016508
+    JB_FUNC_ORIG = bytes.fromhex("ff0303d1f44f0aa9")  # sub sp,#0xc0 ; stp x20,x19
+    JB_FUNC_PATCH = struct.pack("<II", 0x52800000, 0xD65F03C0)  # mov w0,#0 ; ret
+
+    fn_ok = False
+    if m[JB_FUNC_FILEOFF:JB_FUNC_FILEOFF + 8] == JB_FUNC_ORIG:
+        m[JB_FUNC_FILEOFF:JB_FUNC_FILEOFF + 8] = JB_FUNC_PATCH
+        fn_ok = True
+
+    return bytes(m), patches, jb, fn_ok
 
 
 def main():
@@ -116,9 +129,13 @@ def main():
         nom = {2: "MH_EXECUTE", 6: "MH_DYLIB"}.get(ft, str(ft))
         print(f"  {label:6} off={off:<10} size={size:<10} filetype={nom}")
 
-    out, patches, jb = patcher(data)
+    out, patches, jb, fn_ok = patcher(data)
 
     print(f"\n{len(jb)} chemins de detection jailbreak neutralises")
+    if fn_ok:
+        print("fonction de detection JB (arm64) patchee: mov w0,#0 ; ret")
+    else:
+        print("ATTENTION: fonction JB non trouvee a l'offset attendu -- NON patchee")
     print(f"\n{len(patches)} chaines patchees:")
     for off, s, new in patches:
         print(f"  off={off:<10} {s.decode()[:58]}")
