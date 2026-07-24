@@ -23,6 +23,18 @@ HOSTS = [
     b"eve.gameloft.com",            # services profil
 ]
 
+# Chemins de detection de jailbreak (obfusques dans le binaire).
+# LiveContainer declenche ces checks -> prevent_start_if_jailbroken
+# -> blocage volontaire sur UI_DOWNLOADING_PROFILE.
+JB_PATHS = [
+    b"/Ljbrbrz/MpbjlfSvbstrbtf/MobileSubstrate.dylib",
+    b"/Applications/Czdjb.bpp",
+    b"/var/lib/czdjb",
+    b"/var/tmp/czdjb.log",
+    b"/ftc/bpt",
+    b"/var/lib/apt",
+]
+
 
 def info_macho(data):
     """Retourne la liste des slices (label, offset, filetype)."""
@@ -63,7 +75,23 @@ def patcher(data):
             patches.append((off, s, new))
     for off, s, new in patches:
         m[off:off + len(s)] = new
-    return bytes(m), patches
+
+    # --- detection de jailbreak ---
+    jb = []
+    for p in JB_PATHS:
+        i = 0
+        while True:
+            i = bytes(m).find(p, i)
+            if i < 0:
+                break
+            repl = b"/zz" + b"z" * (len(p) - 3)
+            if len(repl) != len(p):
+                raise RuntimeError("longueur JB modifiee")
+            m[i:i + len(p)] = repl
+            jb.append((i, p))
+            i += 1
+
+    return bytes(m), patches, jb
 
 
 def main():
@@ -88,8 +116,9 @@ def main():
         nom = {2: "MH_EXECUTE", 6: "MH_DYLIB"}.get(ft, str(ft))
         print(f"  {label:6} off={off:<10} size={size:<10} filetype={nom}")
 
-    out, patches = patcher(data)
+    out, patches, jb = patcher(data)
 
+    print(f"\n{len(jb)} chemins de detection jailbreak neutralises")
     print(f"\n{len(patches)} chaines patchees:")
     for off, s, new in patches:
         print(f"  off={off:<10} {s.decode()[:58]}")
