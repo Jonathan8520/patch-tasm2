@@ -97,7 +97,10 @@ jobs:
             - Signature stripped (re-sign with LiveContainer / SideStore / Sideloadly)
             - Built by the `Patch TASM2 IPA` workflow (run #${{ github.run_number }})
 
-            Scope: the game launches and plays offline. Story progress is not
-            kept between launches — see the README.
+            Includes the local save patch: all 17 save objects now persist to
+            local `ud_<Name>.sav` files through the game's own serialisers,
+            instead of only the few that were not server-backed. Derived from
+            disassembly, not yet confirmed on a device — the README explains
+            how to check it in one snapshot.
           files: SpiderMan2_patched.ipa
           fail_on_unmatched_files: true

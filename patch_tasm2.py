@@ -8,6 +8,11 @@ the "do we need to download the profile?" decision at the single call site
 that leads to the spinner, routing the game to its own native UI_FIRST_CHECK
 state ("no profile to download") instead.
 
+Local save patch: three `cbz` instructions become `nop`, so all 17 save
+objects persist to local ud_<Name>.sav files through the game's own
+serialisers, instead of only the handful that were not server-backed. See
+LOCAL_SAVE_DESIGN.md. Disable with --no-local-save.
+
 Complementary patches: dead Gameloft hosts rewritten to .invalid, jailbreak
 detection paths and function neutralised. Every edit preserves string and
 instruction lengths exactly, so no Mach-O offset is ever shifted.
@@ -152,7 +157,77 @@ def patch_profile_skip(m):
     return True, call_off
 
 
-def patch(data):
+# --- local save -------------------------------------------------------------
+#
+# Every save object carries a byte at +0x25: "this object is persisted to a
+# local ud_<Name>.sav file". It defaults to 0 (the object constructor sets
+# +0x24 = 1 "server-persisted" and zeroes +0x25), and only a handful of
+# objects — settings, essentially — turn it on. Everything else travelled in
+# the Gameloft profile blob, which is why story progress vanishes offline.
+#
+# Three branches read that byte and each one blocks a different half of local
+# persistence. Neutralising all three routes every object through the exact
+# code path the surviving settings already use, with the game's own
+# serialisers:
+#
+#   save-all loop  CSaveMgr::Update  skips objects with +0x25 == 0
+#   write gate     SaveObj::Save     sends the blob to the upload queue
+#                                    instead of writing ud_<Name>.sav
+#   read gate      SaveObj::Reload   skips ReadFile() on reset/load
+#
+# Each site is `ldrb wT, [xN, #0x25]` followed by `cbz wT, <skip>`; those 8
+# bytes are unique in the whole __text section, so the patch self-locates.
+# The flag itself is left alone: if a profile ever arrives, the profile path
+# still behaves as designed.
+
+LOCAL_SAVE_SITES = [
+    ("save-all loop filter (CSaveMgr::Update)", bytes.fromhex("c8964039a8020034")),
+    ("local-write gate (SaveObj::Save)",        bytes.fromhex("6896403988030034")),
+    ("local-read gate (SaveObj::Reload)",       bytes.fromhex("68964039e8000034")),
+]
+NOP = struct.pack("<I", 0xD503201F)
+
+
+def patch_local_save(m):
+    """
+    Neutralise the three "is this object persisted locally?" branches.
+
+    Returns (sites, error). `sites` is a list of (label, file_offset); `error`
+    is None on success or a message when the patch could not be applied
+    completely. A partial application would be worse than none — objects that
+    write a file nobody reads back, or vice versa — so the caller aborts.
+    """
+    base, size = arm64_slice_off(m)
+    if base is None:
+        return [], "no arm64 slice"
+    sects = arm64_sections(m, base)
+    if "__text" not in sects:
+        return [], "no __text section"
+    tx_addr, tx_off, tx_size = sects["__text"]
+    text = bytes(m[tx_off:tx_off + tx_size])
+
+    done = []
+    for label, sig in LOCAL_SAVE_SITES:
+        hits = []
+        i = 0
+        while True:
+            i = text.find(sig, i)
+            if i < 0:
+                break
+            hits.append(i)
+            i += 1
+        if len(hits) != 1:
+            return done, f"{label}: expected 1 match, found {len(hits)}"
+        # the branch to neutralise is the second instruction of the signature
+        off = tx_off + hits[0] + 4
+        if (struct.unpack("<I", m[off:off + 4])[0] & 0xFF000000) != 0x34000000:
+            return done, f"{label}: second instruction is not a CBZ"
+        m[off:off + 4] = NOP
+        done.append((label, off))
+    return done, None
+
+
+def patch(data, local_save=True):
     m = bytearray(data)
     patches = []
     pat = re.compile(rb"[\x20-\x7e]{6,130}")
@@ -204,15 +279,21 @@ def patch(data):
     # --- MAIN PATCH: skip the profile download ---
     skip_ok, skip_off = patch_profile_skip(m)
 
-    return bytes(m), patches, jb, fn_ok, skip_ok, skip_off
+    # --- LOCAL SAVE: persist every save object to ud_<Name>.sav ---
+    ls_sites, ls_err = patch_local_save(m) if local_save else ([], None)
+
+    return bytes(m), patches, jb, fn_ok, skip_ok, skip_off, ls_sites, ls_err
 
 
 def main():
-    if len(sys.argv) != 3:
-        print("usage: patch_tasm2.py <input_binary> <output_binary>")
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = {a for a in sys.argv[1:] if a.startswith("--")}
+    if len(args) != 2:
+        print("usage: patch_tasm2.py [--no-local-save] <input_binary> <output_binary>")
         return 1
+    local_save = "--no-local-save" not in flags
 
-    data = open(sys.argv[1], "rb").read()
+    data = open(args[0], "rb").read()
 
     print(f"size : {len(data)} bytes")
     sha1 = hashlib.sha1(data).hexdigest()
@@ -229,7 +310,21 @@ def main():
         name = {2: "MH_EXECUTE", 6: "MH_DYLIB"}.get(ft, str(ft))
         print(f"  {label:6} off={off:<10} size={size:<10} filetype={name}")
 
-    out, patches, jb, fn_ok, skip_ok, skip_off = patch(data)
+    out, patches, jb, fn_ok, skip_ok, skip_off, ls_sites, ls_err = \
+        patch(data, local_save=local_save)
+
+    if local_save:
+        if ls_err:
+            print(f"\n>>> ERROR: local save patch INCOMPLETE: {ls_err}")
+            for label, off in ls_sites:
+                print(f"    (applied) {label} @ {off}")
+        else:
+            print("\n>>> LOCAL SAVE patched: every save object now persists to "
+                  "ud_<Name>.sav")
+            for label, off in ls_sites:
+                print(f"    cbz -> nop  @ file offset {off:<10} {label}")
+    else:
+        print("\n>>> local save patch skipped (--no-local-save)")
 
     if skip_ok:
         print(f"\n>>> MAIN PATCH applied: skip UI_DOWNLOADING_PROFILE "
@@ -263,8 +358,14 @@ def main():
         print("ERROR: main patch missing, aborting")
         return 1
 
-    open(sys.argv[2], "wb").write(out)
-    print(f"\nOK -> {sys.argv[2]} ({len(out)} bytes)")
+    if local_save and ls_err:
+        # A half-applied local save is worse than none: objects would write
+        # files nobody reads back, or be reloaded from files nobody writes.
+        print("ERROR: local save patch incomplete, aborting")
+        return 1
+
+    open(args[1], "wb").write(out)
+    print(f"\nOK -> {args[1]} ({len(out)} bytes)")
     print("No live Gameloft host left. Profile: skipped -> UI_FIRST_CHECK.")
     return 0
 
