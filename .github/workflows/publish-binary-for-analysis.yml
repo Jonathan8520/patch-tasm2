@@ -44,6 +44,20 @@ jobs:
           unzip -l original.ipa > bundle-listing.txt
           wc -l bundle-listing.txt
 
+      - name: Extract the small data files
+        run: |
+          # The save-object names live in the game's config data, not in the
+          # binary: it looks them up as GetConfig("SaveIndex<n>").
+          mkdir -p data
+          for f in gamedata.pak Sample.conf GameOptions.json oconf.bar \
+                   macaroane.in snsconfig.json automat.pak effects.pak; do
+            unzip -j -o original.ipa "Payload/*.app/iphone/$f" -d data || \
+              echo "missing: $f"
+          done
+          ls -la data/
+          tar czf gamedata-bundle.tar.gz -C data .
+          ls -la gamedata-bundle.tar.gz
+
       - name: Compress
         run: |
           gzip -9 -c out/AmazingSpiderMan2 > AmazingSpiderMan2.gz
@@ -67,4 +81,5 @@ jobs:
           files: |
             AmazingSpiderMan2.gz
             bundle-listing.txt.gz
+            gamedata-bundle.tar.gz
           fail_on_unmatched_files: true
