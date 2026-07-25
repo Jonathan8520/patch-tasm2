@@ -227,6 +227,38 @@ def patch_local_save(m):
     return done, None
 
 
+def verify_local_save(data):
+    """
+    Check an already-patched binary: each site must read as `ldrb` + `nop`,
+    and the original `ldrb` + `cbz` must be gone. Run against the binary that
+    actually ships, after it has been copied back into the bundle and rezipped.
+    """
+    base, size = arm64_slice_off(data)
+    if base is None:
+        return ["no arm64 slice"]
+    sects = arm64_sections(data, base)
+    tx_addr, tx_off, tx_size = sects["__text"]
+    text = bytes(data[tx_off:tx_off + tx_size])
+    problems = []
+    for label, sig in LOCAL_SAVE_SITES:
+        if sig in text:
+            problems.append(f"{label}: original cbz still present")
+
+    # Two of the three sites share the very same `ldrb w8, [x19, #0x25]`, and
+    # both cbz become the same nop, so their patched forms are identical.
+    # Count per distinct ldrb encoding instead of per site.
+    expected = {}
+    for label, sig in LOCAL_SAVE_SITES:
+        expected.setdefault(sig[:4], []).append(label)
+    for ldrb, labels in expected.items():
+        n = text.count(ldrb + NOP)
+        if n != len(labels):
+            problems.append(
+                f"{' / '.join(labels)}: expected {len(labels)} patched "
+                f"site(s) for this ldrb, found {n}")
+    return problems
+
+
 def patch(data, local_save=True):
     m = bytearray(data)
     patches = []
@@ -288,8 +320,23 @@ def patch(data, local_save=True):
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = {a for a in sys.argv[1:] if a.startswith("--")}
+
+    if "--verify-local-save" in flags:
+        if len(args) != 1:
+            print("usage: patch_tasm2.py --verify-local-save <patched_binary>")
+            return 1
+        problems = verify_local_save(open(args[0], "rb").read())
+        for p in problems:
+            print(f"FAIL: {p}")
+        if problems:
+            return 1
+        print(f"local save verified: {len(LOCAL_SAVE_SITES)} sites patched in "
+              f"{args[0]}")
+        return 0
+
     if len(args) != 2:
         print("usage: patch_tasm2.py [--no-local-save] <input_binary> <output_binary>")
+        print("       patch_tasm2.py --verify-local-save <patched_binary>")
         return 1
     local_save = "--no-local-save" not in flags
 

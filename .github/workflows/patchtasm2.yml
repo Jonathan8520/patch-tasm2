@@ -84,6 +84,8 @@ jobs:
           strings "$BIN" | grep -E 'https?://[a-z0-9.-]*gameloft\.com' || echo "none : OK"
           echo "--- injected .invalid hosts ---"
           strings "$BIN" | grep -c 'invalid' || true
+          echo "--- local save patch, checked on the binary that ships ---"
+          python3 patch_tasm2.py --verify-local-save "$BIN"
 
       - name: Publish the IPA as a Release
         uses: softprops/action-gh-release@v2
