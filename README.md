@@ -44,7 +44,7 @@ predicate itself is called from ~50 other places and is left alone. The patch
 self-locates through the single reference to the string, so it does not rely
 on hardcoded offsets.
 
-### Local save patch (three instructions)
+### Local save patch (five instructions)
 
 Each of the game's 17 save objects carries a byte at `+0x25`: *"persist me to
 a local `ud_<Name>.sav` file"*. The constructor sets `+0x24 = 1`
@@ -52,14 +52,21 @@ a local `ud_<Name>.sav` file"*. The constructor sets `+0x24 = 1`
 turn it on. Everything else — progression included — travelled inside the
 Gameloft profile blob, which is why it evaporates offline.
 
-Three branches read that byte, and each blocks a different half of local
-persistence:
+Five branches read that byte, and each blocks a part of local persistence:
 
 | Site | Function | Effect when the flag is 0 |
 |---|---|---|
 | `0x10021a1b8` | `CSaveMgr::Update` save-all loop | object skipped, `Save` never called |
 | `0x1002127a8` | `SaveObj::Save` | blob queued for upload instead of written to disk |
 | `0x10021250c` | `SaveObj::Reload` | `ReadFile` skipped, nothing read back |
+| `0x10021bc7c` | `CSaveMgr::ReloadAll` | object skipped — never armed, never loaded at startup |
+| `0x10021bce0` | `CSaveMgr::ReloadAll` | its `ReadFile` skipped |
+
+`ReloadAll` is the decisive one. It runs at session start and after every
+save-all, and it is what makes an object *state-ready* — which is
+`SaveObj::Save`'s own second condition. An object it skips is never armed, so
+`Save` returns without writing it. A first build patching only the top three
+gates produced 9 files instead of 17 for exactly that reason.
 
 Replacing each `cbz` with a `nop` sends every object down the path the
 surviving settings already use, with **the game's own serialisers on both
@@ -116,8 +123,9 @@ objects that Gameloft kept server-side.
 |---|---|
 | **v1** — remove the writer's "dirty" gate | Regression: stuck at 45 % on load. The writer flushes `ud_*.sav` **untimed** (only `ud_Spider2.sav` has a 20 s timer), so without the gate it ran every frame → I/O storm. |
 | **v2** — set the dirty flag on the event-driven flush | Files appeared for the objects that were already local-capable, but progression still did not come back. |
-| **v3** — patch `ldrb [x22,#0x25]` | That is `0x10021a1b4`, the save-all **loop filter** — only one of the three gates. Letting the loop reach `Save` changes nothing while `Save` still routes the blob to the upload queue. No file appeared, and the flag looked innocent. |
-| **now** — all three gates | Save-all reaches every object, `Save` writes `ud_<Name>.sav`, and `Reload` reads it back. |
+| **v3** — patch `ldrb [x22,#0x25]` | That is `0x10021a1b4`, the save-all **loop filter** — one gate out of five. Letting the loop reach `Save` changes nothing while `Save` still routes the blob to the upload queue. No file appeared, and the flag looked innocent. |
+| **v4** — three gates (save-all, write, read) | Real progress: 9 files instead of 6, including `QuestManager`, `Trophy`, `MCSkill`, and the main menu appeared for the first time. But 8 objects still silent, because `ReloadAll` never armed them. |
+| **now** — five gates, `ReloadAll` included | Every object is armed at startup, saved, and read back. |
 
 ### `ud_Spider2.sav` is dead code
 
@@ -199,9 +207,12 @@ accepts files up to 2 GB and does not count against that quota.
 
 - ✅ **Verified on device** (LiveContainer, iOS): the “Downloading profile”
   hang is gone; the game launches and plays offline.
-- 🔬 **Not yet tested on device:** the local save patch. Derived from
-  disassembly and reusing the code path that already persists settings, but
-  no build carrying it has been run yet.
+- 🔬 **Partially verified:** the three-gate build wrote 9 `ud_*.sav` files
+  instead of 6 — `QuestManager`, `Trophy`, `MCSkill`, `Tutorial` among them —
+  they survived a real relaunch, and the main menu appeared for the first
+  time. Story progress did not come back: 8 objects were still not armed.
+  The current build adds the two `ReloadAll` gates that caused that, and has
+  not been tested yet.
 
 ### How to check the local save on device
 
@@ -219,8 +230,8 @@ Three outcomes, each diagnostic:
 | What you see | What it means |
 |---|---|
 | ~17 `ud_*.sav` files, progress restored | done |
-| ~17 files, progress **not** restored | writes work, the read-back or the profile scalars are the remaining half — see [what is not covered](LOCAL_SAVE_DESIGN.md#what-is-not-covered) |
-| still ~6 files | the save-all loop is not reaching the new objects; start again at `0x10021a1b8` |
+| ~17 files, progress **not** restored | writes and arming work; the profile scalars are the remaining half — see [what is not covered](LOCAL_SAVE_DESIGN.md#what-is-not-covered) |
+| still ~9 files (no `ud_Economy`, `ud_Item`, `ud_FriendList`) | `ReloadAll` still is not arming them; start again at `0x10021bc7c` |
 
 ## No-patch alternative
 

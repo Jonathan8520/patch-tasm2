@@ -1,7 +1,8 @@
-# Local save — how it works, and why it is three NOPs
+# Local save — how it works, and why it is five NOPs
 
-Status: **implemented** in `patch_tasm2.py` (`patch_local_save`). This file is
-the reasoning behind those three instructions, and the map of the save
+Status: **implemented** in `patch_tasm2.py` (`patch_local_save`), and
+partially confirmed on device — see [Device results](#device-results). This
+file is the reasoning behind those five instructions, and the map of the save
 subsystem for anyone who needs to go further.
 
 All addresses are virtual addresses in the arm64 slice, which is linked at
@@ -89,24 +90,55 @@ Note also what `ApplyProfile` does when a member is **absent**: it assigns an
 empty string and still sets `+0x2a = 1`. An empty payload is therefore a
 supported input, which is what makes the first launch after patching safe.
 
-## The three gates
+## The five gates
 
-`+0x25` is read in four places. Three of them each block a different half of
-local persistence:
+`+0x25` is read in six places inside the save subsystem. Five of them each
+block a part of local persistence:
 
 | Site | Function | Effect when `+0x25 == 0` |
 |---|---|---|
 | `0x10021a1b8` | `CSaveMgr::Update` save-all loop | the object is skipped entirely — `Save` is never called |
 | `0x1002127a8` | `SaveObj::Save` | the blob goes to the upload queue instead of `ud_<Name>.sav` |
 | `0x10021250c` | `SaveObj::Reload` | `ReadFile` is skipped, so nothing is read back |
+| `0x10021bc7c` | `CSaveMgr::ReloadAll` | the object is skipped entirely — never armed, never loaded |
+| `0x10021bce0` | `CSaveMgr::ReloadAll` | its `ReadFile` is skipped |
 
 Replacing each `cbz` with a `nop` routes every object down the path the
 surviving settings already use. The flag byte itself is left untouched, so if
 a profile ever does arrive the profile path still behaves as designed.
 
-The fourth site, `0x10021236c` inside `Load`, is a guarded re-read that
-tail-calls `Load` again. It is deliberately **not** patched: forcing it would
-risk a recursion that only terminates because `ReadFile` sets `+0x2a`.
+`CSaveMgr::ReloadAll` (`0x10021bc3c`) is the one that decides whether an
+object ever becomes usable. For each object it resets the state, calls
+`ReadFile`, then `Load`. That is also what makes an object **state-ready**,
+which is `SaveObj::Save`'s second condition (`+0x28 == 0 && +0x29 != 0`). An
+object ReloadAll skips is never armed, so `Save` returns without writing —
+even with the first three gates neutralised.
+
+It has two callers, both benign:
+
+- `0x100276da8`, in the session init that loads `Constants.bin` — this is the
+  startup load. (The earlier notes called `0x100276760` an "event-driven
+  flush"; it is not, it is initialisation.)
+- `0x10021a21c`, immediately after the save-all loop — the files it re-reads
+  were just written, so it is a no-op in practice.
+
+Its two gates must be patched **together**: the first skips the object, the
+second skips only the read. Neutralising the first alone would reset an
+object's strings and then not read them back, wiping it.
+
+The sixth site, `0x10021236c` inside `Load`, is a guarded re-read that
+tail-calls `Load` again, terminating only because `ReadFile` sets `+0x2a`.
+It is deliberately **not** patched: `ReloadAll` already fills `+0x60` from the
+file before calling `Load`, so forcing it buys nothing and risks a loop.
+
+### How the first launch after patching resolves itself
+
+On the first launch the 8 newly-enabled objects have no file yet. Startup
+`ReloadAll` reads nothing, falls back to the per-index default at
+`mgr+0xb60+i*0x30`, and — crucially — arms them. From that point every
+save-all writes them, and the next launch reads them back. The chicken and
+egg resolves in one session, because the startup `ReloadAll` runs before any
+gameplay.
 
 ### Why this is not the v1 regression
 
@@ -121,6 +153,32 @@ v3 patched `ldrb w8, [x22, #0x25]` — that is `0x10021a1b4`, the save-all loop
 filter, and only that. Letting the loop reach `Save` achieves nothing while
 `Save` itself still routes the blob to the upload queue at `0x1002127a8`. No
 file appears, and the flag looks innocent. All three gates have to go.
+
+## Device results
+
+The three-gate build was tested on device. It was not enough, but it moved a
+long way and it named the missing piece.
+
+Before the patch: at most six `ud_*.sav` files. With three gates, after the
+tutorial:
+
+```
+ud_System.sav 234   ud_Tutorial.sav 178   ud_InitPos.sav 202
+ud_QuestManager.sav 186   ud_Trophy.sav 626   ud_MCSkill.sav 186
+ud_Control.sav 250   ud_Sound.sav 218   ud_WorldEnvironment.sav 178
+```
+
+Nine files, including `QuestManager`, `Trophy` and `MCSkill` — objects that
+had never written anything. They survived a real relaunch untouched (still
+stamped 01:44 after a restart at 01:46). And the game showed its **main menu**
+for the first time instead of dropping straight into the tutorial, which means
+it did detect a save.
+
+But nine files, not seventeen — `Economy`, `Item` and `FriendList` among the
+missing, and those three *had* appeared under the old v2 experiment. That is
+what pointed at `ReloadAll`: those eight objects were never armed, so
+`SaveObj::Save` refused them. The tutorial still restarted, consistent with
+the objects that carry mission state never being loaded at startup.
 
 ## Evidence this path works offline
 

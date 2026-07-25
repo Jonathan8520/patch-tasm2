@@ -170,20 +170,39 @@ def patch_profile_skip(m):
 # code path the surviving settings already use, with the game's own
 # serialisers:
 #
-#   save-all loop  CSaveMgr::Update  skips objects with +0x25 == 0
-#   write gate     SaveObj::Save     sends the blob to the upload queue
-#                                    instead of writing ud_<Name>.sav
-#   read gate      SaveObj::Reload   skips ReadFile() on reset/load
+#   save-all loop   CSaveMgr::Update    skips objects with +0x25 == 0
+#   write gate      SaveObj::Save       sends the blob to the upload queue
+#                                       instead of writing ud_<Name>.sav
+#   read gate       SaveObj::Reload     skips ReadFile() on reset/load
+#   reload-all      CSaveMgr::ReloadAll skips the object entirely
+#   reload-all read CSaveMgr::ReloadAll skips its ReadFile()
+#
+# ReloadAll is what runs at session start (right after Constants.bin is
+# loaded) and again after every save-all. It is what arms an object: reset,
+# ReadFile, Load. An object it skips never becomes "state ready", so
+# SaveObj::Save refuses to write it — which is why patching only the first
+# three gates produced 9 files instead of 17.
+#
+# Its two gates must be patched together or not at all: the first one skips
+# the object, the second one skips only the read. Neutralising the first
+# alone would reset an object's state and then not read it back, wiping it.
 #
 # Each site is `ldrb wT, [xN, #0x25]` followed by `cbz wT, <skip>`; those 8
 # bytes are unique in the whole __text section, so the patch self-locates.
 # The flag itself is left alone: if a profile ever arrives, the profile path
 # still behaves as designed.
+#
+# One further site, 0x100212368 inside SaveObj::Load, is deliberately left
+# alone. It is a guarded re-read that tail-calls Load again, terminating only
+# because ReadFile sets +0x2a; ReloadAll already fills +0x60 from the file
+# before calling Load, so forcing it would buy nothing and risk a loop.
 
 LOCAL_SAVE_SITES = [
     ("save-all loop filter (CSaveMgr::Update)", bytes.fromhex("c8964039a8020034")),
     ("local-write gate (SaveObj::Save)",        bytes.fromhex("6896403988030034")),
     ("local-read gate (SaveObj::Reload)",       bytes.fromhex("68964039e8000034")),
+    ("object filter (CSaveMgr::ReloadAll)",     bytes.fromhex("88964039a8040034")),
+    ("read gate (CSaveMgr::ReloadAll)",         bytes.fromhex("88964039c8000034")),
 ]
 NOP = struct.pack("<I", 0xD503201F)
 
