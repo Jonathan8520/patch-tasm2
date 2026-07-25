@@ -142,6 +142,22 @@ Whether that matters depends on something static analysis could not settle
 cheaply: whether gameplay recomputes those counters from the restored save
 objects, or reads them as the source of truth.
 
+There is one encouraging data point. Every one of the 28 derived save-object
+vtables overrides both serialise slots (`+0x18`, `+0x28`) with real code — the
+base class implements them as bare `ret`, so an object that did not override
+them would write nothing. And three of those overrides reach straight into the
+progress manager, e.g.
+
+```
+0x100216c10   adrp x8, 0x101074000
+              ldr  x0, [x8, #0xa30]      ; the progress manager
+              b    0x1001f7054           ; tail-call into it
+```
+
+So at least one save object is bound to that manager, and its blob carries
+progress state. The scalars the profile carried separately may well be a
+summary the game recomputes.
+
 If the device test shows progression coming back but a counter or a chapter
 label reading wrong, that block is the culprit, and the fix does not need a
 new format — everything needed to call the game's own deserialiser is now
