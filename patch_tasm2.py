@@ -254,7 +254,77 @@ def verify_local_save(data):
     return problems
 
 
-def patch(data, local_save=True):
+# --- chapter persistence ----------------------------------------------------
+#
+# The local save format cannot carry the story cursor. `chapter` lives at
+# progressMgr+0x2a4 (the manager at [0x101074a30]) and is written by exactly
+# three functions -- 0x1001ed308, 0x10021bd60 and ApplyProfile -- every one of
+# them a profile/network applier. No local path ever writes it, so offline it
+# is always 0, and 0x1001fc844 reads it as "start from the beginning" while
+# 0x1001f25d8 turns it into chapter 1. That is why the prologue replays on
+# every launch, however well the save objects themselves are restored.
+#
+# ud_QuestManager persists exactly two ints, through a helper pair used by
+# nothing else in the binary:
+#
+#     0x1001ff4a8  serialise    writes progressMgr+0x2d8, then +0x2dc
+#     0x1001ff4dc  deserialise  version 3 reads them back into the same two
+#
+# +0x2dc is the current mission id, and -1 means "none" -- at which point
+# 0x1001f96f4 falls back to reading `chapter`. A save taken between missions
+# therefore holds (mission = -1, chapter = 0) and has nothing to resume from.
+#
+# So swap the second field for the chapter on both sides. It stays two ints at
+# version 3, so the file format and its length are unchanged. The cost is that
+# a save taken *during* a mission restarts that mission rather than resuming
+# mid-way; the gain is that the chapter survives, which is the thing actually
+# blocking.
+#
+# Not enabled by default: it changes what the second int means, so an existing
+# ud_QuestManager.sav would be misread (its -1 would land in `chapter`).
+# Delete that file once before running a build that carries this.
+
+CHAPTER_SITES = [
+    ("serialise chapter instead of current mission (0x1001ff4c8)",
+     bytes.fromhex("81de42b9e00313aa"), 0, 0xB942A681),
+    ("restore chapter instead of current mission (0x1001ff594)",
+     bytes.fromhex("60de02b910000014"), 0, 0xB902A660),
+]
+
+
+def patch_chapter_persist(m):
+    """
+    Make ud_QuestManager carry progressMgr+0x2a4 (chapter) in place of +0x2dc
+    (current mission). Returns (sites, error); nothing is written on error.
+    """
+    base, size = arm64_slice_off(m)
+    if base is None:
+        return [], "no arm64 slice"
+    sects = arm64_sections(m, base)
+    tx_addr, tx_off, tx_size = sects["__text"]
+    text = bytes(m[tx_off:tx_off + tx_size])
+
+    planned = []
+    for label, sig, idx, word in CHAPTER_SITES:
+        hits, i = [], 0
+        while True:
+            i = text.find(sig, i)
+            if i < 0:
+                break
+            hits.append(i)
+            i += 1
+        if len(hits) != 1:
+            return [], f"{label}: expected 1 match, found {len(hits)}"
+        planned.append((label, tx_off + hits[0] + idx * 4, word))
+
+    done = []
+    for label, off, word in planned:
+        m[off:off + 4] = struct.pack("<I", word)
+        done.append((label, off))
+    return done, None
+
+
+def patch(data, local_save=True, chapter=False):
     m = bytearray(data)
     patches = []
     pat = re.compile(rb"[\x20-\x7e]{6,130}")
@@ -309,7 +379,11 @@ def patch(data, local_save=True):
     # --- LOCAL SAVE: persist every save object to ud_<Name>.sav ---
     ls_sites, ls_err = patch_local_save(m) if local_save else ([], None)
 
-    return bytes(m), patches, jb, fn_ok, skip_ok, skip_off, ls_sites, ls_err
+    # --- optional: carry the story chapter in the local save ---
+    ch_sites, ch_err = patch_chapter_persist(m) if chapter else ([], None)
+
+    return (bytes(m), patches, jb, fn_ok, skip_ok, skip_off, ls_sites, ls_err,
+            ch_sites, ch_err)
 
 
 def main():
@@ -329,7 +403,8 @@ def main():
         return 0
 
     if len(args) != 2:
-        print("usage: patch_tasm2.py [--no-local-save] <input_binary> <output_binary>")
+        print("usage: patch_tasm2.py [--no-local-save] [--persist-chapter] "
+              "<input_binary> <output_binary>")
         print("       patch_tasm2.py --verify-local-save <patched_binary>")
         return 1
     local_save = "--no-local-save" not in flags
@@ -351,8 +426,18 @@ def main():
         name = {2: "MH_EXECUTE", 6: "MH_DYLIB"}.get(ft, str(ft))
         print(f"  {label:6} off={off:<10} size={size:<10} filetype={name}")
 
-    out, patches, jb, fn_ok, skip_ok, skip_off, ls_sites, ls_err = \
-        patch(data, local_save=local_save)
+    chapter = "--persist-chapter" in flags
+    out, patches, jb, fn_ok, skip_ok, skip_off, ls_sites, ls_err, ch_sites, ch_err = \
+        patch(data, local_save=local_save, chapter=chapter)
+
+    if chapter:
+        if ch_err:
+            print(f"\n>>> ERROR: chapter persistence NOT applied: {ch_err}")
+        else:
+            print("\n>>> CHAPTER persistence patched: ud_QuestManager now carries "
+                  "progressMgr+0x2a4")
+            for label, off in ch_sites:
+                print(f"    @ file offset {off:<10} {label}")
 
     if local_save:
         if ls_err:
@@ -397,6 +482,10 @@ def main():
         # the profile skip is the whole point of this build: refuse to ship a
         # binary that would not unblock anything.
         print("ERROR: main patch missing, aborting")
+        return 1
+
+    if chapter and ch_err:
+        print("ERROR: chapter persistence incomplete, aborting")
         return 1
 
     if local_save and ls_err:

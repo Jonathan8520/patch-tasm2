@@ -7,6 +7,10 @@ on:
         description: "Direct IPA URL (archive.org)"
         required: true
         default: "https://archive.org/download/the_amazing_spider_man_2_v1_3_1_ipa_1.3.1_ios_8.0/The_Amazing_Spider_Man_2_v1_3_1_ipa_1.3.1_ios_8.0.ipa"
+      patch_flags:
+        description: "Extra flags for patch_tasm2.py (e.g. --persist-chapter)"
+        required: false
+        default: ""
       release_tag:
         description: "Tag of the Release that will hold the patched IPA"
         required: false
@@ -49,7 +53,7 @@ jobs:
 
       - name: Patch the binary
         run: |
-          python3 patch_tasm2.py \
+          python3 patch_tasm2.py ${{ github.event.inputs.patch_flags }} \
             "$APP/AmazingSpiderMan2" \
             AmazingSpiderMan2_patched
           # replace while keeping the executable bit
