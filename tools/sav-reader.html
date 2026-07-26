@@ -1,0 +1,617 @@
+<title>Lecteur de sauvegardes TASM2</title>
+
+<style>
+  :root {
+    --ground: #f5f6f9;
+    --surface: #ffffff;
+    --ink: #15171c;
+    --ink-dim: #596074;
+    --ink-faint: #878ea1;
+    --rule: #dde1ea;
+    --rule-strong: #c3c9d6;
+    --accent: #ab1f2c;
+    --on-accent: #ffffff;
+    --ok: #17714f;
+    --ok-bg: #e4f2ea;
+    --warn: #97600b;
+    --warn-bg: #faeed6;
+    --bad: #ab1f2c;
+    --bad-bg: #f8e5e6;
+    --neutral-bg: #eceff5;
+
+    --sans: ui-sans-serif, -apple-system, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #0e1013;
+      --surface: #16181d;
+      --ink: #e7e9ef;
+      --ink-dim: #969dae;
+      --ink-faint: #6d7488;
+      --rule: #252932;
+      --rule-strong: #363c48;
+      --accent: #ff6f76;
+      --on-accent: #22090b;
+      --ok: #55c495;
+      --ok-bg: #14291f;
+      --warn: #e0a94a;
+      --warn-bg: #2b2314;
+      --bad: #ff6f76;
+      --bad-bg: #2c1618;
+      --neutral-bg: #1e222a;
+    }
+  }
+
+  :root[data-theme="light"] {
+    --ground: #f5f6f9; --surface: #ffffff; --ink: #15171c; --ink-dim: #596074;
+    --ink-faint: #878ea1; --rule: #dde1ea; --rule-strong: #c3c9d6;
+    --accent: #ab1f2c; --on-accent: #ffffff; --ok: #17714f; --ok-bg: #e4f2ea;
+    --warn: #97600b; --warn-bg: #faeed6; --bad: #ab1f2c; --bad-bg: #f8e5e6;
+    --neutral-bg: #eceff5;
+  }
+
+  :root[data-theme="dark"] {
+    --ground: #0e1013; --surface: #16181d; --ink: #e7e9ef; --ink-dim: #969dae;
+    --ink-faint: #6d7488; --rule: #252932; --rule-strong: #363c48;
+    --accent: #ff6f76; --on-accent: #22090b; --ok: #55c495; --ok-bg: #14291f;
+    --warn: #e0a94a; --warn-bg: #2b2314; --bad: #ff6f76; --bad-bg: #2c1618;
+    --neutral-bg: #1e222a;
+  }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.5;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  .wrap {
+    max-width: 40rem;
+    margin: 0 auto;
+    padding: 2rem 1.125rem 4rem;
+    display: flex;
+    flex-direction: column;
+    gap: 1.75rem;
+  }
+
+  .masthead { display: flex; flex-direction: column; gap: 0.5rem; }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 0.6875rem;
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+
+  .masthead h1 {
+    margin: 0;
+    font-size: 1.6875rem;
+    line-height: 1.18;
+    font-weight: 640;
+    letter-spacing: -0.02em;
+    text-wrap: balance;
+  }
+
+  .lede { margin: 0; color: var(--ink-dim); font-size: 0.9375rem; }
+
+  .picker {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    padding: 1.25rem;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+  }
+
+  .picker.over { border-color: var(--accent); }
+
+  .pick-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.8125rem 1rem;
+    background: var(--accent);
+    color: var(--on-accent);
+    border: none;
+    border-radius: 2px;
+    font: inherit;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    cursor: pointer;
+  }
+
+  .pick-btn:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+
+  .picker-hint { margin: 0; font-size: 0.8125rem; color: var(--ink-faint); }
+
+  .warning {
+    margin: 0;
+    padding: 0.75rem 0.875rem;
+    background: var(--bad-bg);
+    color: var(--bad);
+    font-size: 0.875rem;
+    border-radius: 2px;
+  }
+
+  .results { display: flex; flex-direction: column; gap: 1.25rem; }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+
+  .card-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+    padding: 0.875rem 1rem;
+    border-bottom: 1px solid var(--rule);
+  }
+
+  .fname {
+    font-family: var(--mono);
+    font-size: 0.875rem;
+    font-weight: 600;
+    word-break: break-all;
+  }
+
+  .pill {
+    font-family: var(--mono);
+    font-size: 0.6875rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 0.1875rem 0.5rem;
+    border-radius: 2px;
+    white-space: nowrap;
+  }
+
+  .pill-ok { background: var(--ok-bg); color: var(--ok); }
+  .pill-warn { background: var(--warn-bg); color: var(--warn); }
+  .pill-bad { background: var(--bad-bg); color: var(--bad); }
+  .pill-info { background: var(--neutral-bg); color: var(--ink-dim); }
+
+  .verdict {
+    padding: 1rem;
+    border-bottom: 1px solid var(--rule);
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+  }
+
+  .verdict-line {
+    margin: 0;
+    font-size: 1.0625rem;
+    font-weight: 620;
+    letter-spacing: -0.01em;
+    text-wrap: balance;
+  }
+
+  .verdict-ok .verdict-line { color: var(--ok); }
+  .verdict-warn .verdict-line { color: var(--warn); }
+  .verdict-bad .verdict-line { color: var(--bad); }
+
+  .verdict-note { margin: 0; font-size: 0.875rem; color: var(--ink-dim); }
+
+  .fields { display: grid; grid-template-columns: auto 1fr; }
+
+  .fields dt {
+    padding: 0.5rem 0.75rem 0.5rem 1rem;
+    font-family: var(--mono);
+    font-size: 0.6875rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+
+  .fields dd {
+    margin: 0;
+    padding: 0.5rem 1rem 0.5rem 0;
+    font-family: var(--mono);
+    font-size: 0.8125rem;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    border-bottom: 1px solid var(--rule);
+    overflow-wrap: anywhere;
+  }
+
+  .fields dt:last-of-type, .fields dd:last-of-type { border-bottom: none; }
+
+  .dump { padding: 0.875rem 1rem 1rem; border-top: 1px solid var(--rule); }
+
+  .dump-label {
+    margin: 0 0 0.4375rem;
+    font-family: var(--mono);
+    font-size: 0.6875rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+
+  .dump pre {
+    margin: 0;
+    padding: 0.625rem 0.75rem;
+    background: var(--neutral-bg);
+    border-radius: 2px;
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    line-height: 1.65;
+    white-space: pre-wrap;
+    word-break: break-all;
+    overflow-x: auto;
+  }
+
+  .footnote {
+    border-top: 1px solid var(--rule-strong);
+    padding-top: 1.25rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.625rem;
+  }
+
+  .footnote h2 {
+    margin: 0;
+    font-size: 0.6875rem;
+    font-family: var(--mono);
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    font-weight: 600;
+  }
+
+  .footnote p { margin: 0; font-size: 0.875rem; color: var(--ink-dim); }
+  .footnote code { font-family: var(--mono); font-size: 0.8125em; color: var(--ink); }
+</style>
+
+<div class="wrap">
+  <header class="masthead">
+    <span class="eyebrow">The Amazing Spider-Man 2 · 1.3.1</span>
+    <h1>Lecteur de sauvegardes</h1>
+    <p class="lede">
+      Ouvre un <code>ud_*.sav</code> pris dans le dossier <code>Documents</code> du jeu
+      et lis ce qu'il contient. Tout est décodé ici même, dans la page — rien n'est envoyé nulle part.
+    </p>
+  </header>
+
+  <div class="picker" id="picker">
+    <button class="pick-btn" id="pick" type="button">Choisir des fichiers .sav</button>
+    <p class="picker-hint" id="hint">
+      Plusieurs fichiers à la fois, c'est possible. Sur ordinateur tu peux aussi les déposer ici.
+    </p>
+  </div>
+
+  <div class="results" id="results"></div>
+
+  <section class="footnote">
+    <h2>Ce qu'il faut regarder</h2>
+    <p>
+      <code>ud_QuestManager.sav</code> est le fichier décisif : son deuxième entier porte
+      le chapitre depuis le build <code>chapter-save</code>. Chapitre 0 → l'intro du tutoriel
+      se relance. Chapitre ≥ 1 → elle est passée.
+    </p>
+    <p>
+      Les autres fichiers sont là pour le contexte : l'heure d'écriture dit quels objets
+      le jeu a réellement sauvegardés pendant la session.
+    </p>
+  </section>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  const DELTA = 0x9E3779B9;
+  const u32 = (x) => x >>> 0;
+
+  function deobfuscate(blob) {
+    if (blob.length < 4) throw new Error("fichier plus court que son en-tête de 4 octets");
+    const dv = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+    const n = u32(dv.getUint32(0, true) ^ 0x2a);
+    const notes = [];
+    if (blob.length !== 4 + 2 * n) notes.push("taille " + blob.length + ", attendu " + (4 + 2 * n));
+    if (n <= 0 || 4 + n > blob.length) throw new Error("longueur de charge utile invraisemblable (" + n + ")");
+
+    const first = blob.subarray(4, 4 + n);
+    const plain = new Uint8Array(n);
+    for (let i = 0; i < n; i++) plain[i] = first[i] ^ ((i + 42) % 127);
+
+    let same = true;
+    for (let i = 0; i < n; i++) {
+      if (blob[4 + n + i] !== (first[i] ^ ((7 * i) % 23))) { same = false; break; }
+    }
+    notes.push(same ? "copie miroir conforme" : "copie miroir NON conforme");
+    return { plain: plain, notes: notes };
+  }
+
+  function xxteaDecrypt(v, key) {
+    const n = v.length;
+    if (n < 2) return v;
+    let rounds = 6 + Math.floor(52 / n);
+    let total = u32(rounds * DELTA);
+    let y = v[0], z, e, mx;
+    const step = (kIdx) => {
+      const a = u32(u32(z >>> 5) ^ u32(y << 2));
+      const b = u32(u32(y >>> 3) ^ u32(z << 4));
+      const c = u32(u32(total ^ y) + u32(key[kIdx] ^ z));
+      return u32((a + b) ^ c);
+    };
+    while (rounds) {
+      e = (total >>> 2) & 3;
+      for (let p = n - 1; p > 0; p--) {
+        z = v[p - 1];
+        mx = step((p & 3) ^ e);
+        v[p] = u32(v[p] - mx);
+        y = v[p];
+      }
+      z = v[n - 1];
+      mx = step(e);
+      v[0] = u32(v[0] - mx);
+      y = v[0];
+      total = u32(total - DELTA);
+      rounds--;
+    }
+    return v;
+  }
+
+  const CRC_TABLE = (function () {
+    const t = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+      let c = i;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      t[i] = u32(c);
+    }
+    return t;
+  })();
+
+  function crc32(bytes) {
+    let c = 0xFFFFFFFF;
+    for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+    return u32(c ^ 0xFFFFFFFF);
+  }
+
+  async function inflate(bytes) {
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  }
+
+  async function decode(blob) {
+    const first = deobfuscate(blob);
+    const notes = first.notes;
+    const env = JSON.parse(new TextDecoder().decode(first.plain));
+
+    const bin = atob(env.b);
+    const raw = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) raw[i] = bin.charCodeAt(i);
+    if (raw.length < 16) throw new Error("bloc plus court que ses 16 octets de queue");
+
+    const body = raw.subarray(0, raw.length - 16);
+    const tv = new DataView(raw.buffer, raw.byteOffset + raw.length - 16, 16);
+    const origLen = tv.getUint32(0, true), compLen = tv.getUint32(4, true);
+    const padLen = tv.getUint32(8, true), ts = tv.getUint32(12, true);
+    if (padLen !== body.length) notes.push("bourrage " + padLen + " ≠ corps " + body.length);
+    if (body.length % 4) throw new Error("le corps n'est pas un nombre entier de mots de 32 bits");
+
+    const key = [u32((ts & 0xFF000000) ^ compLen), u32((ts & 0x00FF0000) ^ compLen),
+                 u32((ts & 0x0000FF00) ^ origLen), u32((ts & 0x000000FF) ^ origLen)];
+
+    const words = new Uint32Array(body.length / 4);
+    const bv = new DataView(body.buffer, body.byteOffset, body.byteLength);
+    for (let i = 0; i < words.length; i++) words[i] = bv.getUint32(i * 4, true);
+    xxteaDecrypt(words, key);
+
+    const clear = new Uint8Array(words.length * 4);
+    const cv = new DataView(clear.buffer);
+    for (let i = 0; i < words.length; i++) cv.setUint32(i * 4, words[i], true);
+
+    const storedCrc = cv.getUint32(compLen - 4, true);
+    const payload = await inflate(clear.subarray(0, compLen - 4));
+    if (payload.length !== origLen) notes.push("décompressé à " + payload.length + ", l'en-tête dit " + origLen);
+    const actual = crc32(payload);
+    notes.push(actual === storedCrc ? "crc32 correct" : "crc32 INCORRECT");
+
+    return { payload: payload, version: env.v, time: env.t, orig: origLen, notes: notes };
+  }
+
+  // --- lecture métier ------------------------------------------------------
+
+  function ints(payload) {
+    const dv = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+    const out = [];
+    for (let i = 0; i + 4 <= payload.length; i += 4) out.push(dv.getInt32(i, true));
+    return out;
+  }
+
+  function popcount(x) {
+    let n = 0, v = x >>> 0;
+    while (v) { n += v & 1; v >>>= 1; }
+    return n;
+  }
+
+  function hex(payload, limit) {
+    const max = Math.min(payload.length, limit);
+    const parts = [];
+    for (let i = 0; i < max; i++) parts.push(payload[i].toString(16).padStart(2, "0"));
+    let s = parts.join(" ");
+    if (payload.length > max) s += " … (+" + (payload.length - max) + " octets)";
+    return s;
+  }
+
+  function objectName(filename) {
+    const m = /ud_(.+)\.sav$/i.exec(filename);
+    return m ? m[1] : null;
+  }
+
+  function interpret(name, res) {
+    const v = ints(res.payload);
+
+    if (name === "QuestManager") {
+      if (v.length !== 2) return null;
+      const quests = v[0], slot = v[1];
+      if (slot === -1) {
+        return { tone: "warn", pill: "à supprimer",
+          line: "Aucun chapitre enregistré",
+          note: "Le deuxième entier vaut −1 : c'est l'id de mission en attente, écrit par un build sans le patch chapitre. Supprime ce fichier avant le premier lancement de chapter-save, sinon ce −1 sera lu comme le chapitre." };
+      }
+      if (slot === 0) {
+        return { tone: "warn", pill: "prologue",
+          line: "Chapitre 0 — l'intro du tutoriel se relancera",
+          note: "Le chapitre est bien enregistré, mais il vaut 0. Le jeu redemande alors story01_mission01. Termine le prologue entièrement, quitte, et relis ce fichier." };
+      }
+      if (slot > 0) {
+        return { tone: "ok", pill: "chapitre " + slot,
+          line: "Chapitre " + slot + " — l'intro ne se relancera pas",
+          note: "Le chapitre est enregistré et restauré. C'est exactement le résultat attendu." };
+      }
+      return { tone: "bad", pill: "valeur douteuse",
+        line: "Chapitre " + slot + " — valeur inattendue",
+        note: "Le chapitre devrait être compris entre 0 et 8. Supprime le fichier et refais le prologue." };
+    }
+
+    if (name === "Tutorial" && v.length === 1) {
+      const bits = popcount(v[0]);
+      return { tone: "info", pill: bits + " étape" + (bits > 1 ? "s" : ""),
+        line: bits + " étape" + (bits > 1 ? "s" : "") + " de tutoriel validée" + (bits > 1 ? "s" : ""),
+        note: "Masque 0x" + u32(v[0]).toString(16) + ". Ce masque n'a aucun effet sur le relancement de l'intro — c'est le chapitre qui décide." };
+    }
+
+    if (name === "Spider2") {
+      return { tone: "info", pill: "fichier mort",
+        line: "Aucune donnée de jeu",
+        note: "Le jeu écrit ici le chemin du fichier lui-même, brouillé avec une clé aléatoire jamais conservée, et aucun code ne le relit. À ignorer." };
+    }
+
+    return null;
+  }
+
+  // --- rendu ---------------------------------------------------------------
+
+  const results = document.getElementById("results");
+
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  function addField(dl, label, value) {
+    dl.appendChild(el("dt", null, label));
+    dl.appendChild(el("dd", null, value));
+  }
+
+  function renderFailure(filename, message, name) {
+    const card = el("div", "card");
+    const head = el("div", "card-head");
+    head.appendChild(el("span", "fname", filename));
+    const isDead = name === "Spider2";
+    head.appendChild(el("span", "pill " + (isDead ? "pill-info" : "pill-bad"),
+                        isDead ? "fichier mort" : "illisible"));
+    card.appendChild(head);
+
+    const verdict = el("div", "verdict " + (isDead ? "" : "verdict-bad"));
+    verdict.appendChild(el("p", "verdict-line",
+      isDead ? "Aucune donnée de jeu" : "Ce fichier ne se décode pas"));
+    verdict.appendChild(el("p", "verdict-note", isDead
+      ? "Le jeu écrit ici le chemin du fichier lui-même, brouillé avec une clé aléatoire jamais conservée, et aucun code ne le relit. À ignorer."
+      : message));
+    card.appendChild(verdict);
+    results.appendChild(card);
+  }
+
+  function render(filename, res) {
+    const name = objectName(filename);
+    const reading = interpret(name, res);
+    const card = el("div", "card");
+
+    const head = el("div", "card-head");
+    head.appendChild(el("span", "fname", filename));
+    const badCrc = res.notes.some((n) => n.indexOf("INCORRECT") >= 0 || n.indexOf("NON") >= 0);
+    if (badCrc) head.appendChild(el("span", "pill pill-bad", "intégrité KO"));
+    else if (reading) head.appendChild(el("span", "pill pill-" + reading.tone, reading.pill));
+    else head.appendChild(el("span", "pill pill-info", "lu"));
+    card.appendChild(head);
+
+    if (reading) {
+      const verdict = el("div", "verdict verdict-" + reading.tone);
+      verdict.appendChild(el("p", "verdict-line", reading.line));
+      verdict.appendChild(el("p", "verdict-note", reading.note));
+      card.appendChild(verdict);
+    }
+
+    const dl = el("dl", "fields");
+    addField(dl, "écrit le", res.time);
+    addField(dl, "version", String(res.version));
+    addField(dl, "état", res.payload.length + " octets");
+    addField(dl, "intégrité", res.notes.join(" · "));
+    card.appendChild(dl);
+
+    const v = ints(res.payload);
+    if (v.length && v.length <= 16 && res.payload.length % 4 === 0) {
+      const d = el("div", "dump");
+      d.appendChild(el("p", "dump-label", "entiers 32 bits"));
+      d.appendChild(el("pre", null, v.join(", ")));
+      card.appendChild(d);
+    }
+
+    const d2 = el("div", "dump");
+    d2.appendChild(el("p", "dump-label", "octets"));
+    d2.appendChild(el("pre", null, hex(res.payload, 192)));
+    card.appendChild(d2);
+
+    results.appendChild(card);
+  }
+
+  async function handle(files) {
+    results.textContent = "";
+    const list = Array.from(files).sort((a, b) => a.name.localeCompare(b.name));
+    for (const f of list) {
+      const bytes = new Uint8Array(await f.arrayBuffer());
+      const name = objectName(f.name);
+      try {
+        const res = await decode(bytes);
+        render(f.name, res);
+      } catch (e) {
+        renderFailure(f.name, e.message, name);
+      }
+    }
+  }
+
+  const input = document.createElement("input");
+  input.type = "file";
+  input.multiple = true;
+  input.style.display = "none";
+  document.body.appendChild(input);
+  input.addEventListener("change", () => { if (input.files.length) handle(input.files); });
+
+  document.getElementById("pick").addEventListener("click", () => input.click());
+
+  const picker = document.getElementById("picker");
+  ["dragenter", "dragover"].forEach((t) => picker.addEventListener(t, (e) => {
+    e.preventDefault(); picker.classList.add("over");
+  }));
+  ["dragleave", "drop"].forEach((t) => picker.addEventListener(t, (e) => {
+    e.preventDefault(); picker.classList.remove("over");
+  }));
+  picker.addEventListener("drop", (e) => {
+    if (e.dataTransfer && e.dataTransfer.files.length) handle(e.dataTransfer.files);
+  });
+
+  if (typeof DecompressionStream === "undefined") {
+    const w = el("p", "warning",
+      "Ce navigateur ne sait pas décompresser en local (DecompressionStream absent). Ouvre la page dans Safari 16.4 ou plus récent, ou dans Chrome.");
+    picker.appendChild(w);
+  }
+})();
+</script>
