@@ -154,8 +154,22 @@ A seventh site, `0x1002126ac` in `Save`, is deliberately left alone. It picks
 `+0x48` rather than `+0x30` as the document to build into while an object
 occupies the upload slot (`mgr+0xfa0`, fed from a queue at `mgr+0xf90`). That
 is the game's own staging design — the writer promotes `+0x48` into `+0x30`
-after each write — so forcing it would clobber a buffer in flight. The cost of
-leaving it is at most a one-save lag, on one object at a time.
+after each write — so forcing it would clobber a buffer in flight.
+
+Traced concretely, leaving it costs one save on one object, once. Save #1
+builds the document into `+0x48` and writes the (empty) `+0x30`; the writer
+then promotes `+0x48` into `+0x30`. Save #2 finds `+0x30` non-empty, the
+predicate at `0x1002126b4` selects it, and every save from then on is direct.
+It self-corrects.
+
+### What becomes dead code
+
+Four blocks lose their only predecessor and are never executed again: the
+profile-upload branch in `Save` (`0x100212818`), and the three `+0x24`
+fallbacks at `0x100212528`, `0x10021bcf8` and `0x100212440`. Checked on the
+patched binary: none has a remaining branch predecessor, and none is reachable
+by fall-through. No branch anywhere lands inside the blocks that now always
+execute, so nothing is entered with unexpected register state.
 
 ### How the first launch after patching resolves itself
 
