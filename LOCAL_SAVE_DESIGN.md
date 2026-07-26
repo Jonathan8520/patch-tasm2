@@ -1,8 +1,8 @@
-# Local save — how it works, and why it is five NOPs
+# Local save — how it works, and why it is six NOPs
 
 Status: **implemented** in `patch_tasm2.py` (`patch_local_save`), and
 partially confirmed on device — see [Device results](#device-results). This
-file is the reasoning behind those five instructions, and the map of the save
+file is the reasoning behind those six instructions, and the map of the save
 subsystem for anyone who needs to go further.
 
 All addresses are virtual addresses in the arm64 slice, which is linked at
@@ -90,9 +90,9 @@ Note also what `ApplyProfile` does when a member is **absent**: it assigns an
 empty string and still sets `+0x2a = 1`. An empty payload is therefore a
 supported input, which is what makes the first launch after patching safe.
 
-## The five gates
+## The six gates
 
-`+0x25` is read in six places inside the save subsystem. Five of them each
+`+0x25` is read in seven places inside the save subsystem. Six of them each
 block a part of local persistence:
 
 | Site | Function | Effect when `+0x25 == 0` |
@@ -102,6 +102,7 @@ block a part of local persistence:
 | `0x10021250c` | `SaveObj::Reload` | `ReadFile` is skipped, so nothing is read back |
 | `0x10021bc7c` | `CSaveMgr::ReloadAll` | the object is skipped entirely — never armed, never loaded |
 | `0x10021bce0` | `CSaveMgr::ReloadAll` | its `ReadFile` is skipped |
+| `0x10021236c` | `SaveObj::Load` self-reload | its `ReadFile` is skipped, after the state has already been cleared — the object is left wiped **and** unarmed |
 
 Replacing each `cbz` with a `nop` routes every object down the path the
 surviving settings already use. The flag byte itself is left untouched, so if
@@ -112,7 +113,7 @@ object ever becomes usable. For each object it resets the state, calls
 `ReadFile`, then `Load`. That is also what makes an object **state-ready**,
 which is `SaveObj::Save`'s second condition (`+0x28 == 0 && +0x29 != 0`). An
 object ReloadAll skips is never armed, so `Save` returns without writing —
-even with the first three gates neutralised.
+even with the save-all, write and read gates neutralised.
 
 It has two callers, both benign:
 
@@ -126,10 +127,35 @@ Its two gates must be patched **together**: the first skips the object, the
 second skips only the read. Neutralising the first alone would reset an
 object's strings and then not read them back, wiping it.
 
-The sixth site, `0x10021236c` inside `Load`, is a guarded re-read that
-tail-calls `Load` again, terminating only because `ReadFile` sets `+0x2a`.
-It is deliberately **not** patched: `ReloadAll` already fills `+0x60` from the
-file before calling `Load`, so forcing it buys nothing and risks a loop.
+### The invariant that makes this safe
+
+Three functions reset a save object — `Load`'s self-reload branch, `Reload`
+and `ReloadAll`. Each clears `+0x30`, `+0x48` and `+0x60` and sets
+`+0x28 = 1`, then reads the file back. Before the sixth gate was patched, the
+self-reload branch cleared the state and then, for a server-backed object,
+took `0x100212440`, found `+0x24 != 0`, and returned — leaving the object
+**wiped and unarmed**. With all six gates neutralised, every reset is followed
+by a `ReadFile`; this was checked mechanically against the patched binary, not
+by eye.
+
+`Load`'s self-reload tail-calls `Load` again, and that recursion is bounded at
+exactly one level in both directions:
+
+- `ReadFile` sets `+0x2a = 1` on *both* of its paths — file read
+  (`0x100212020`) and file missing (`0x100211af4`) — and the function has a
+  single exit at `0x100212078`, so the re-entry takes the apply branch and
+  finishes.
+- Even if `+0x2a` were somehow left clear, the re-entry falls straight out at
+  `0x100212424`.
+
+There is no path on which it loops.
+
+A seventh site, `0x1002126ac` in `Save`, is deliberately left alone. It picks
+`+0x48` rather than `+0x30` as the document to build into while an object
+occupies the upload slot (`mgr+0xfa0`, fed from a queue at `mgr+0xf90`). That
+is the game's own staging design — the writer promotes `+0x48` into `+0x30`
+after each write — so forcing it would clobber a buffer in flight. The cost of
+leaving it is at most a one-save lag, on one object at a time.
 
 ### How the first launch after patching resolves itself
 
@@ -152,7 +178,7 @@ objects it processes changes, from 6 to 17.
 v3 patched `ldrb w8, [x22, #0x25]` — that is `0x10021a1b4`, the save-all loop
 filter, and only that. Letting the loop reach `Save` achieves nothing while
 `Save` itself still routes the blob to the upload queue at `0x1002127a8`. No
-file appears, and the flag looks innocent. All three gates have to go.
+file appears, and the flag looks innocent. All six gates have to go.
 
 ## Device results
 

@@ -5,9 +5,10 @@ launched and played after Gameloft shut down its servers.
 
 **Scope, stated up front:** the game launches and plays offline, and its save
 objects are now persisted locally instead of to Gameloft's dead profile
-server — see [Local saving](#local-saving). That part is verified by
-disassembly but **not yet confirmed on a device**; it reuses the same code
-path that already keeps your settings across launches.
+server — see [Local saving](#local-saving). An earlier build of that patch
+was tested on device and moved the needle (9 save files instead of 6, and the
+main menu appeared for the first time); the current one closes the gap it
+exposed and has not been tested yet.
 
 ## The problem
 
@@ -44,7 +45,7 @@ predicate itself is called from ~50 other places and is left alone. The patch
 self-locates through the single reference to the string, so it does not rely
 on hardcoded offsets.
 
-### Local save patch (five instructions)
+### Local save patch (six instructions)
 
 Each of the game's 17 save objects carries a byte at `+0x25`: *"persist me to
 a local `ud_<Name>.sav` file"*. The constructor sets `+0x24 = 1`
@@ -52,7 +53,7 @@ a local `ud_<Name>.sav` file"*. The constructor sets `+0x24 = 1`
 turn it on. Everything else — progression included — travelled inside the
 Gameloft profile blob, which is why it evaporates offline.
 
-Five branches read that byte, and each blocks a part of local persistence:
+Six branches read that byte, and each blocks a part of local persistence:
 
 | Site | Function | Effect when the flag is 0 |
 |---|---|---|
@@ -61,6 +62,7 @@ Five branches read that byte, and each blocks a part of local persistence:
 | `0x10021250c` | `SaveObj::Reload` | `ReadFile` skipped, nothing read back |
 | `0x10021bc7c` | `CSaveMgr::ReloadAll` | object skipped — never armed, never loaded at startup |
 | `0x10021bce0` | `CSaveMgr::ReloadAll` | its `ReadFile` skipped |
+| `0x10021236c` | `SaveObj::Load` self-reload | `ReadFile` skipped *after* the state was cleared — object left wiped and unarmed |
 
 `ReloadAll` is the decisive one. It runs at session start and after every
 save-all, and it is what makes an object *state-ready* — which is
@@ -123,9 +125,9 @@ objects that Gameloft kept server-side.
 |---|---|
 | **v1** — remove the writer's "dirty" gate | Regression: stuck at 45 % on load. The writer flushes `ud_*.sav` **untimed** (only `ud_Spider2.sav` has a 20 s timer), so without the gate it ran every frame → I/O storm. |
 | **v2** — set the dirty flag on the event-driven flush | Files appeared for the objects that were already local-capable, but progression still did not come back. |
-| **v3** — patch `ldrb [x22,#0x25]` | That is `0x10021a1b4`, the save-all **loop filter** — one gate out of five. Letting the loop reach `Save` changes nothing while `Save` still routes the blob to the upload queue. No file appeared, and the flag looked innocent. |
+| **v3** — patch `ldrb [x22,#0x25]` | That is `0x10021a1b4`, the save-all **loop filter** — one gate out of six. Letting the loop reach `Save` changes nothing while `Save` still routes the blob to the upload queue. No file appeared, and the flag looked innocent. |
 | **v4** — three gates (save-all, write, read) | Real progress: 9 files instead of 6, including `QuestManager`, `Trophy`, `MCSkill`, and the main menu appeared for the first time. But 8 objects still silent, because `ReloadAll` never armed them. |
-| **now** — five gates, `ReloadAll` included | Every object is armed at startup, saved, and read back. |
+| **now** — six gates, `ReloadAll` included | Every object is armed at startup, saved, and read back. |
 
 ### `ud_Spider2.sav` is dead code
 
