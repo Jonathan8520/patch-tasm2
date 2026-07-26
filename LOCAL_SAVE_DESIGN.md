@@ -222,6 +222,89 @@ Two control results from the same data:
   rest of the container is shader and HTTP caches plus the allocator's two
   64 MB backing files.
 
+## The real blocker: `chapter`
+
+A fourth device snapshot settled it. A known-good `Documents` was restored
+into a fresh container and the game relaunched. **Seven of the nine
+`ud_*.sav` came back bit-identical**, and `ud_MCSkill` and `ud_System` were
+rewritten with identical content — read, applied, re-serialised. The save
+objects restore correctly. Nothing was destroyed.
+
+The tutorial still replayed, and the reason is a single 32-bit field.
+
+`chapter` lives at `progressMgr+0x2a4` (the manager at `[0x101074a30]`). It is
+written by exactly three functions, and every one of them is a profile
+applier:
+
+| Writer | What it is |
+|---|---|
+| `0x1001ed308` | a network response parser (`rewardsp`, `dailyCount`, `next_xp`, `chapter`) |
+| `0x10021bd60` | the in-`Update` profile applier |
+| `0x10021cef8` | `ApplyProfile` |
+
+**No local path ever writes it.** Offline it is always 0, and:
+
+```
+0x1001fc860   x8 = *(0x101074a30)
+0x1001fc864   w8 = x8->[0x2a4]        ; chapter
+0x1001fc868   cbnz w8, ...            ; non-zero -> carry on
+                                      ; zero     -> start from the beginning
+```
+
+while `0x1001f25d8` turns it into `chapter >= 8 ? 0 : chapter + 1` — the
+prologue.
+
+`ud_QuestManager` persists exactly two ints, through a helper pair called from
+nowhere else in the binary:
+
+```
+0x1001ff4a8  serialise    writes progressMgr+0x2d8, then +0x2dc
+0x1001ff4dc  deserialise  version 3 reads them straight back
+```
+
+`+0x2dc` is the current mission id; `-1` means "none", and at that point
+`0x1001f96f4` falls back to reading `chapter`. A save taken between missions
+therefore holds `(mission = -1, chapter = 0)` and has nothing to resume from —
+which is exactly the `(250454, -1)` in the device data.
+
+The legacy `v0`/`v1` branch of that same deserialiser *does* read `+0x2a4`.
+Gameloft moved the chapter out of the local format when they moved it to the
+server.
+
+### `--persist-chapter`
+
+Two 4-byte edits swap the second persisted field for the chapter, on both
+sides:
+
+```
+0x1001ff4c8   ldr w1, [x20, #0x2dc]  ->  ldr w1, [x20, #0x2a4]
+0x1001ff594   str w0, [x19, #0x2dc]  ->  str w0, [x19, #0x2a4]
+```
+
+Still two ints at version 3, so the file format and its length are unchanged.
+The cost is that a save taken *during* a mission restarts that mission rather
+than resuming mid-way.
+
+Off by default, because it changes what the second int means: an existing
+`ud_QuestManager.sav` would have its `-1` land in `chapter`. Delete that one
+file once before the first launch of a build carrying this.
+
+Still unrestored either way: `finish_ch8` (`+0x2a8`) and the three mission
+counters (`+0x2f0`, `+0x2f4`, `+0x2f8`). Nothing serialises them locally.
+
+### A quirk worth recording
+
+The tutorial object's deserialiser reads three of its four bytes when the
+stored version is 0:
+
+```
+0x100216cc4   cmp w9, #1
+0x100216cc8   b.lt <skip>          ; version 0 -> the fourth byte is not read
+```
+
+while its serialiser always writes four. `ud_Tutorial.sav` carries `v = 0`, so
+its fourth byte never round-trips. It happened to be zero in every sample.
+
 ## What is still missing offline
 
 `RequestLoadAll` (`0x10021bd40`) is what sets `mgr[0xf51]`, which
