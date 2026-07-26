@@ -59,16 +59,60 @@ The functions that matter:
 | `0x10021a158` | `CSaveMgr::Update(mgr)` — the save-all / load-all state machine |
 | `0x10021cef8` | `ApplyProfile(int err, rapidjson::Value* doc)` — applies a server profile |
 
-### File format
+### File format — fully decoded
 
-`WriteFile` emits: a 4-byte header equal to `length ^ 0x2a`, then the payload
-**twice** — first XORed byte-wise with `(i + 42) % 127`, then that same buffer
-XORed again with `(7*i) % 23` and written a second time. `ReadFile` reads the
-header and only the first copy; the second is dead weight, almost certainly a
-copy-paste slip in the original code.
+Four layers, all recovered and confirmed against real files pulled off a
+device. `tools/decode_sav.py` implements the whole chain.
 
-That explains the header/size ratio observed on device (header `123`, payload
-`246` bytes): it is one length and two copies, not a 16-bit unit count.
+1. **File obfuscation** (writer `0x1002115f0`): a 4-byte header equal to
+   `length ^ 0x2a`, then the payload **twice** — first XORed byte-wise with
+   `(i + 42) % 127`, then that same buffer XORed again with `(7*i) % 23`.
+   `ReadFile` consumes only the first copy; the second is dead weight,
+   almost certainly a copy-paste slip. Every file is exactly `4 + 2N` bytes,
+   which is a free integrity check.
+
+2. **JSON envelope**: `{"b": <base64>, "t": <GMT time>, "v": <format>}`.
+   `v` comes from `mgr[index*0x30 + 0xb54]` and is a per-object *format*
+   version — it does not move when the same object is written again.
+
+3. **The blob** (decoder `0x100211224` → `0x1002113a8`):
+   `[body][origLen][compLen][padLen][unix ts]`, the body padded to a multiple
+   of 4 and **XXTEA**-encrypted (delta `0x9e3779b9`, `6 + 52/n` rounds) with a
+   128-bit key built entirely from the file's own trailer:
+
+   ```
+   key[0] = (ts & 0xff000000) ^ compLen
+   key[1] = (ts & 0x00ff0000) ^ compLen
+   key[2] = (ts & 0x0000ff00) ^ origLen
+   key[3] = (ts & 0x000000ff) ^ origLen
+   ```
+
+   No device secret is mixed in unless the object sets its `+0x26` flag, and
+   none of the seventeen does.
+
+4. **zlib**: bytes `[0, compLen-4)` inflate to `origLen`, and the four bytes at
+   `compLen-4` are a `crc32` of the result. It verifies on every file.
+
+That also explains the header/size ratio first seen on device (header `123`,
+payload `246` bytes): one length and two copies, not a 16-bit unit count.
+
+### What the objects actually hold
+
+Decoded from a real post-tutorial container:
+
+| Object | Bytes | Content |
+|---|---|---|
+| `ud_Tutorial` | 4 | a bitmask of completed tutorial steps — `0x0002073e`, nine bits set |
+| `ud_QuestManager` | 8 | a quest bitmask (`0x0003d256`, ten bits) plus a current-quest id of `-1` |
+| `ud_InitPos` | 12 | three floats — where Spider-Man was standing |
+| `ud_MCSkill` | 12 | `(0, 0, 200)` |
+| `ud_Sound` | 34 | two ints, the string `1.3.1e`, five volume floats |
+| `ud_Control` | 86 | on-screen button coordinates |
+| `ud_Trophy` | 932 | header `(50, 84)` then exactly 84 records of 11 bytes |
+| `ud_System` | 183 | flags and a unix timestamp |
+
+This settles the question the whole patch turns on: **story progress really is
+written to disk**, in files the unpatched game never reads back.
 
 ## What the profile carried
 
