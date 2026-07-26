@@ -127,7 +127,8 @@ objects that Gameloft kept server-side.
 | **v3** — patch `ldrb [x22,#0x25]` | That is `0x10021a1b4`, the save-all **loop filter** — one gate out of seven. Letting the loop reach `Save` changes nothing while `Save` still routes the blob to the upload queue. No file appeared, and the flag looked innocent. |
 | **v4** — three gates `nop`ed | 9 files instead of 6, and the main menu appeared for the first time. But 8 objects stayed silent, and progress did not come back. |
 | **v5** — six gates `nop`ed | Made it *worse*: `ud_Tutorial.sav` went from `0x0002073e` (nine steps) to `0x0000003e` (five). Arming an object without making it local means it gets written from a state that was never restored. |
-| **now** — one instruction, in `ReloadAll` | The flag itself is set, so the twelve server objects take the exact path the five settings objects already take. |
+| **v6** — one instruction, in `ReloadAll` | The flag itself is set, so the twelve server objects take the exact path the five settings objects already take. **Verified on device: the save objects are written and restored correctly.** |
+| **v7** — `--persist-chapter` | Disproved by measurement: the field persists, but `chapter` is always 0 offline because only profile appliers ever write it. Off by default; do not enable. |
 
 ### `ud_Spider2.sav` is dead code
 

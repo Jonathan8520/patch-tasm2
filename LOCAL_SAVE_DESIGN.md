@@ -271,9 +271,9 @@ The legacy `v0`/`v1` branch of that same deserialiser *does* read `+0x2a4`.
 Gameloft moved the chapter out of the local format when they moved it to the
 server.
 
-### `--persist-chapter`
+### `--persist-chapter` — tried, measured, and wrong
 
-Two 4-byte edits swap the second persisted field for the chapter, on both
+Two 4-byte edits swap the second persisted field for the chapter on both
 sides:
 
 ```
@@ -281,16 +281,25 @@ sides:
 0x1001ff594   str w0, [x19, #0x2dc]  ->  str w0, [x19, #0x2a4]
 ```
 
-Still two ints at version 3, so the file format and its length are unchanged.
-The cost is that a save taken *during* a mission restarts that mission rather
-than resuming mid-way.
+It works exactly as designed, and that is how it was disproved. A device run
+completed the tutorial with this build and produced
 
-Off by default, because it changes what the second int means: an existing
-`ud_QuestManager.sav` would have its `-1` land in `chapter`. Delete that one
-file once before the first launch of a build carrying this.
+```
+ud_QuestManager.sav   (250454, 0)      was (250454, -1)
+```
 
-Still unrestored either way: `finish_ch8` (`+0x2a8`) and the three mission
-counters (`+0x2f0`, `+0x2f4`, `+0x2f8`). Nothing serialises them locally.
+The second slot now genuinely carries `chapter` — **and `chapter` is 0.** It
+was always going to be. Its only three writers are profile appliers, so
+nothing offline ever advances it; persisting it stores a zero, and the cost is
+the current-mission id it displaced.
+
+**Do not enable this.** The flag is kept in the patcher only so the experiment
+is reproducible, and it stays off by default.
+
+The wider point it settles: story progression was **server-authoritative**.
+The client reports events and the server maintained `chapter`,
+`missionCount` and `finish_ch8`. No amount of local persistence recovers a
+counter the client never computes.
 
 ### A quirk worth recording
 
