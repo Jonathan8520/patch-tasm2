@@ -1,8 +1,8 @@
-# Local save — how it works, and why it is six NOPs
+# Local save — how it works, and why it is one instruction
 
 Status: **implemented** in `patch_tasm2.py` (`patch_local_save`), and
 partially confirmed on device — see [Device results](#device-results). This
-file is the reasoning behind those six instructions, and the map of the save
+file is the reasoning behind that instruction, and the map of the save
 subsystem for anyone who needs to go further.
 
 All addresses are virtual addresses in the arm64 slice, which is linked at
@@ -134,135 +134,121 @@ Note also what `ApplyProfile` does when a member is **absent**: it assigns an
 empty string and still sets `+0x2a = 1`. An empty payload is therefore a
 supported input, which is what makes the first launch after patching safe.
 
-## The six gates
+## The fix: one instruction
 
-`+0x25` is read in seven places inside the save subsystem. Six of them each
-block a part of local persistence:
+`+0x25` is read in seven places inside the save subsystem. An earlier build
+neutralised six of them with `nop`. That was the wrong shape of fix, and the
+device proved it: bypassing the *readers* while leaving the flag false
+produces objects that are "armed" but still not local — a state no part of the
+machine expects. See [Device results](#device-results).
 
-| Site | Function | Effect when `+0x25 == 0` |
-|---|---|---|
-| `0x10021a1b8` | `CSaveMgr::Update` save-all loop | the object is skipped entirely — `Save` is never called |
-| `0x1002127a8` | `SaveObj::Save` | the blob goes to the upload queue instead of `ud_<Name>.sav` |
-| `0x10021250c` | `SaveObj::Reload` | `ReadFile` is skipped, so nothing is read back |
-| `0x10021bc7c` | `CSaveMgr::ReloadAll` | the object is skipped entirely — never armed, never loaded |
-| `0x10021bce0` | `CSaveMgr::ReloadAll` | its `ReadFile` is skipped |
-| `0x10021236c` | `SaveObj::Load` self-reload | its `ReadFile` is skipped, after the state has already been cleared — the object is left wiped **and** unarmed |
+The manager's constructor is explicit about the intent. It inlines all
+seventeen save objects as subobjects (index 0 is the manager itself, at
+version 8 — that is `ud_System`; the next is at `mgr+0x1b8`, then `+0x224`,
+`+0x250`, …). For every one of them it sets `+0x24 = 1` ("server-persisted"),
+and for exactly **five** it also sets `+0x25 = 1`:
 
-Replacing each `cbz` with a `nop` routes every object down the path the
-surviving settings already use. The flag byte itself is left untouched, so if
-a profile ever does arrive the profile path still behaves as designed.
+```
+0x1002182b4  strb w23, [x19, #0x275]     ; object at +0x250
+0x100218330  strb w23, [x19, #0x2ed]     ; object at +0x2c8
+0x100218558  strb w23, [x19, #0x4f5]     ; object at +0x4d0
+0x100218658  strb w23, [x19, #0x605]     ; object at +0x5e0
+0x100218690  strb w23, [x19, #0x659]     ; object at +0x634
+```
 
-`CSaveMgr::ReloadAll` (`0x10021bc3c`) is the one that decides whether an
-object ever becomes usable. For each object it resets the state, calls
-`ReadFile`, then `Load`. That is also what makes an object **state-ready**,
-which is `SaveObj::Save`'s second condition (`+0x28 == 0 && +0x29 != 0`). An
-object ReloadAll skips is never armed, so `Save` returns without writing —
-even with the save-all, write and read gates neutralised.
+Those five work perfectly, and the device data proves it: `ud_Sound`'s first
+field carried the value 27 unchanged from one session into the next. So the
+job is not to route around the flag — it is to **set it**.
 
-It has two callers, both benign:
+`CSaveMgr::ReloadAll` (`0x10021bc3c`) already walks all seventeen objects at
+session start, already holds the constant 1 in `w25`, and already has the
+object pointer in `x20`. Its first act on each object is the branch that skips
+the non-local ones:
 
-- `0x100276da8`, in the session init that loads `Constants.bin` — this is the
-  startup load. (The earlier notes called `0x100276760` an "event-driven
-  flush"; it is not, it is initialisation.)
-- `0x10021a21c`, immediately after the save-all loop — the files it re-reads
-  were just written, so it is a no-op in practice.
+```
+0x10021bc78   ldrb w8, [x20, #0x25]
+0x10021bc7c   cbz  w8, <next object>   ->   strb w25, [x20, #0x25]
+```
 
-Its two gates must be patched **together**: the first skips the object, the
-second skips only the read. Neutralising the first alone would reset an
-object's strings and then not read them back, wiping it.
+One instruction. From that point every object is genuinely local, so all seven
+original gates pass on their own — including `0x1002126a4` in `SaveObj::Save`,
+which selects `+0x30` over `+0x48` as the document to build into and which no
+`nop` could have fixed safely. Twelve objects become byte-for-byte equivalent
+in treatment to the five that already work.
 
-### The invariant that makes this safe
+The eight bytes of `ldrb` + `cbz` are unique in `__text`, so the patch
+self-locates, and `--verify-local-save` re-checks the binary that actually
+ships.
 
-Three functions reset a save object — `Load`'s self-reload branch, `Reload`
-and `ReloadAll`. Each clears `+0x30`, `+0x48` and `+0x60` and sets
-`+0x28 = 1`, then reads the file back. Before the sixth gate was patched, the
-self-reload branch cleared the state and then, for a server-backed object,
-took `0x100212440`, found `+0x24 != 0`, and returned — leaving the object
-**wiped and unarmed**. With all six gates neutralised, every reset is followed
-by a `ReadFile`; this was checked mechanically against the patched binary, not
-by eye.
+### Why the flag is set here and not in the constructor
 
-`Load`'s self-reload tail-calls `Load` again, and that recursion is bounded at
-exactly one level in both directions:
-
-- `ReadFile` sets `+0x2a = 1` on *both* of its paths — file read
-  (`0x100212020`) and file missing (`0x100211af4`) — and the function has a
-  single exit at `0x100212078`, so the re-entry takes the apply branch and
-  finishes.
-- Even if `+0x2a` were somehow left clear, the re-entry falls straight out at
-  `0x100212424`.
-
-There is no path on which it loops.
-
-A seventh site, `0x1002126ac` in `Save`, is deliberately left alone. It picks
-`+0x48` rather than `+0x30` as the document to build into while an object
-occupies the upload slot (`mgr+0xfa0`, fed from a queue at `mgr+0xf90`). That
-is the game's own staging design — the writer promotes `+0x48` into `+0x30`
-after each write — so forcing it would clobber a buffer in flight.
-
-Traced concretely, leaving it costs one save on one object, once. Save #1
-builds the document into `+0x48` and writes the (empty) `+0x30`; the writer
-then promotes `+0x48` into `+0x30`. Save #2 finds `+0x30` non-empty, the
-predicate at `0x1002126b4` selects it, and every save from then on is direct.
-It self-corrects.
-
-### What becomes dead code
-
-Four blocks lose their only predecessor and are never executed again: the
-profile-upload branch in `Save` (`0x100212818`), and the three `+0x24`
-fallbacks at `0x100212528`, `0x10021bcf8` and `0x100212440`. Checked on the
-patched binary: none has a remaining branch predecessor, and none is reachable
-by fall-through. No branch anywhere lands inside the blocks that now always
-execute, so nothing is entered with unexpected register state.
-
-### How the first launch after patching resolves itself
-
-On the first launch the 8 newly-enabled objects have no file yet. Startup
-`ReloadAll` reads nothing, falls back to the per-index default at
-`mgr+0xb60+i*0x30`, and — crucially — arms them. From that point every
-save-all writes them, and the next launch reads them back. The chicken and
-egg resolves in one session, because the startup `ReloadAll` runs before any
-gameplay.
-
-### Why this is not the v1 regression
-
-The v1 attempt hung the game at 45 % by removing a *dirty* gate, so the writer
-ran every frame. Nothing here touches a dirty gate or a timer. The cadence of
-save-all is unchanged — it is still driven by `mgr+0xfa8`; only the number of
-objects it processes changes, from 6 to 17.
-
-### Why v3 looked like the flag was not the lock
-
-v3 patched `ldrb w8, [x22, #0x25]` — that is `0x10021a1b4`, the save-all loop
-filter, and only that. Letting the loop reach `Save` achieves nothing while
-`Save` itself still routes the blob to the upload queue at `0x1002127a8`. No
-file appears, and the flag looks innocent. All six gates have to go.
+The seventeen constructors are inlined into one 935-instruction function with
+constant offsets, so each object's flag store would be a separate site with a
+different immediate, and the ones that do not set it have no spare slot to add
+a store. `ReloadAll` is the earliest single place that iterates the array, and
+it sets the flag before its own `ReadFile`, in the same iteration.
 
 ## Device results
 
-The three-gate build was tested on device. It was not enough, but it moved a
-long way and it named the missing piece.
+Three full container snapshots were taken on device, and they are what settled
+the design. All three are decoded by `tools/decode_sav.py`.
 
-Before the patch: at most six `ud_*.sav` files. With three gates, after the
-tutorial:
+**A** — end of the tutorial, **B** — after a relaunch, both on a build that
+`nop`ed three gates. Between them, `ud_QuestManager`, `ud_Tutorial`,
+`ud_Trophy`, `ud_MCSkill`, `ud_InitPos`, `ud_Control` and
+`ud_WorldEnvironment` are **bit-identical**: never read, never rewritten. Only
+`ud_Sound` and `ud_System` moved.
 
-```
-ud_System.sav 234   ud_Tutorial.sav 178   ud_InitPos.sav 202
-ud_QuestManager.sav 186   ud_Trophy.sav 626   ud_MCSkill.sav 186
-ud_Control.sav 250   ud_Sound.sav 218   ud_WorldEnvironment.sav 178
-```
+**C** — after installing the six-`nop` build. Two things changed, and both
+matter:
 
-Nine files, including `QuestManager`, `Trophy` and `MCSkill` — objects that
-had never written anything. They survived a real relaunch untouched (still
-stamped 01:44 after a restart at 01:46). And the game showed its **main menu**
-for the first time instead of dropping straight into the tutorial, which means
-it did detect a save.
+- `ud_Tutorial` and `ud_MCSkill` were now rewritten, so the patch really did
+  take effect and really did arm those objects.
+- `ud_Tutorial`'s payload went from `0x0002073e` (nine tutorial steps) to
+  `0x0000003e` (five). The value **regressed**: the object started from zero,
+  re-accumulated the first five steps as the tutorial was replayed, and
+  overwrote a good save.
 
-But nine files, not seventeen — `Economy`, `Item` and `FriendList` among the
-missing, and those three *had* appeared under the old v2 experiment. That is
-what pointed at `ReloadAll`: those eight objects were never armed, so
-`SaveObj::Save` refused them. The tutorial still restarted, consistent with
-the objects that carry mission state never being loaded at startup.
+Arming an object without making it local is therefore actively harmful: the
+object gets written, but from a state that was never restored. That is what
+motivated replacing six `nop`s with the single store.
+
+Two control results from the same data:
+
+- `ud_Sound`'s first field held 27 in B and still 27 in C — **the local path
+  restores correctly** for the objects that own the flag.
+- Nothing outside `Documents` holds game state. The preferences plist carries
+  only `launchCount` (2 → 3), a StoreKit timestamp and Facebook SDK data; the
+  rest of the container is shader and HTTP caches plus the allocator's two
+  64 MB backing files.
+
+## What is still missing offline
+
+`RequestLoadAll` (`0x10021bd40`) is what sets `mgr[0xf51]`, which
+`CSaveMgr::Update` consumes at `0x10021a8f0` to run `Reload(obj, 1)` over all
+seventeen objects — reset, `ReadFile`, `Load`. That is the game's own restore
+path, and it is designed to fire **late**, when a profile arrives
+asynchronously.
+
+It has exactly five callers, and every one of them is a network path:
+
+| Caller | Context |
+|---|---|
+| `0x10018dd70` | `[CSnsServerManager] SNS request failed`, `UI_GamecenterLoginFail`, `isNeedReload` |
+| `0x1001d0a1c` | `UI_Request_TimeOut`, `isNeedReload` |
+| `0x10034d07c` | `UI_Request_TimeOut`, `isNeedReload` |
+| `0x1003bb52c` | the connectivity screen, Facebook login/logout |
+| `0x100087008` | the social/friend-list manager |
+
+**Offline none of them runs, so the late restore never happens.** Three of the
+five are failure handlers — the game was built to fall back to the local copy
+when the network fails, which is precisely the case we are in, but the profile
+request is skipped entirely by the main patch, so there is no failure to
+handle.
+
+Marking the objects local makes `ReloadAll` restore them at session start
+instead. Whether that is early enough for every object is the open question
+the next device test answers.
 
 ## Evidence this path works offline
 

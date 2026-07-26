@@ -5,10 +5,9 @@ launched and played after Gameloft shut down its servers.
 
 **Scope, stated up front:** the game launches and plays offline, and its save
 objects are now persisted locally instead of to Gameloft's dead profile
-server — see [Local saving](#local-saving). An earlier build of that patch
-was tested on device and moved the needle (9 save files instead of 6, and the
-main menu appeared for the first time); the current one closes the gap it
-exposed and has not been tested yet.
+server — see [Local saving](#local-saving). Three device snapshots drove that
+patch to its current shape, and the save format is now fully decoded, so the
+next test can be measured rather than inferred.
 
 ## The problem
 
@@ -45,42 +44,42 @@ predicate itself is called from ~50 other places and is left alone. The patch
 self-locates through the single reference to the string, so it does not rely
 on hardcoded offsets.
 
-### Local save patch (six instructions)
+### Local save patch (one instruction)
 
-Each of the game's 17 save objects carries a byte at `+0x25`: *"persist me to
-a local `ud_<Name>.sav` file"*. The constructor sets `+0x24 = 1`
-("server-persisted") and leaves `+0x25` at 0, and only the settings objects
-turn it on. Everything else — progression included — travelled inside the
+Every save object carries a byte at `+0x25`: *"persist me to a local
+`ud_<Name>.sav` file"*. The manager's constructor sets `+0x24 = 1`
+("server-persisted") on all seventeen and `+0x25 = 1` on only **five** of them
+— the settings. Everything else, story progress included, travelled inside the
 Gameloft profile blob, which is why it evaporates offline.
 
-Six branches read that byte, and each blocks a part of local persistence:
+Those five work perfectly, and device data proves it: `ud_Sound`'s state
+carried across a relaunch unchanged. So the fix is not to bypass the seven
+branches that read the flag — an earlier build `nop`ed six of them and made
+things *worse*, producing objects that were armed but still not local, which
+let a good `ud_Tutorial.sav` be overwritten with a regressed one.
 
-| Site | Function | Effect when the flag is 0 |
-|---|---|---|
-| `0x10021a1b8` | `CSaveMgr::Update` save-all loop | object skipped, `Save` never called |
-| `0x1002127a8` | `SaveObj::Save` | blob queued for upload instead of written to disk |
-| `0x10021250c` | `SaveObj::Reload` | `ReadFile` skipped, nothing read back |
-| `0x10021bc7c` | `CSaveMgr::ReloadAll` | object skipped — never armed, never loaded at startup |
-| `0x10021bce0` | `CSaveMgr::ReloadAll` | its `ReadFile` skipped |
-| `0x10021236c` | `SaveObj::Load` self-reload | `ReadFile` skipped *after* the state was cleared — object left wiped and unarmed |
+The fix is to set the flag. `CSaveMgr::ReloadAll` already walks all seventeen
+objects at session start, already holds `1` in `w25`, and already has the
+object in `x20`. Its first act on each object is the branch that skips the
+non-local ones:
 
-`ReloadAll` is the decisive one. It runs at session start and after every
-save-all, and it is what makes an object *state-ready* — which is
-`SaveObj::Save`'s own second condition. An object it skips is never armed, so
-`Save` returns without writing it. A first build patching only the top three
-gates produced 9 files instead of 17 for exactly that reason.
+```
+0x10021bc78   ldrb w8, [x20, #0x25]
+0x10021bc7c   cbz  w8, <next object>   ->   strb w25, [x20, #0x25]
+```
 
-Replacing each `cbz` with a `nop` sends every object down the path the
-surviving settings already use, with **the game's own serialisers on both
-ends** — no new save format, no injected code. The flag itself is untouched,
-so the profile path still behaves correctly if a profile ever arrives.
+Four bytes. From there every object is genuinely local, so all seven original
+gates pass on their own — including one in `SaveObj::Save` that no `nop` could
+have fixed safely. Twelve objects become byte-for-byte equivalent in treatment
+to the five that already work, with **the game's own serialisers on both
+ends** — no new save format, no injected code.
 
-Each site is located by an 8-byte signature (`ldrb wT, [xN, #0x25]` + `cbz`)
-that occurs exactly once in `__text`; the patcher refuses to write anything
-if a signature is missing or ambiguous, and aborts rather than ship a
-half-applied version. Pass `--no-local-save` to build without it.
+The site is located by an 8-byte signature that occurs exactly once in
+`__text`; the patcher writes nothing if it is missing or ambiguous, and
+`--verify-local-save` re-checks the binary that actually ships. Pass
+`--no-local-save` to build without it.
 
-Full reasoning, the save-object layout and the file format:
+Full reasoning, the save-object layout and the decoded file format:
 [LOCAL_SAVE_DESIGN.md](LOCAL_SAVE_DESIGN.md).
 
 ### Complementary patches
@@ -125,9 +124,10 @@ objects that Gameloft kept server-side.
 |---|---|
 | **v1** — remove the writer's "dirty" gate | Regression: stuck at 45 % on load. The writer flushes `ud_*.sav` **untimed** (only `ud_Spider2.sav` has a 20 s timer), so without the gate it ran every frame → I/O storm. |
 | **v2** — set the dirty flag on the event-driven flush | Files appeared for the objects that were already local-capable, but progression still did not come back. |
-| **v3** — patch `ldrb [x22,#0x25]` | That is `0x10021a1b4`, the save-all **loop filter** — one gate out of six. Letting the loop reach `Save` changes nothing while `Save` still routes the blob to the upload queue. No file appeared, and the flag looked innocent. |
-| **v4** — three gates (save-all, write, read) | Real progress: 9 files instead of 6, including `QuestManager`, `Trophy`, `MCSkill`, and the main menu appeared for the first time. But 8 objects still silent, because `ReloadAll` never armed them. |
-| **now** — six gates, `ReloadAll` included | Every object is armed at startup, saved, and read back. |
+| **v3** — patch `ldrb [x22,#0x25]` | That is `0x10021a1b4`, the save-all **loop filter** — one gate out of seven. Letting the loop reach `Save` changes nothing while `Save` still routes the blob to the upload queue. No file appeared, and the flag looked innocent. |
+| **v4** — three gates `nop`ed | 9 files instead of 6, and the main menu appeared for the first time. But 8 objects stayed silent, and progress did not come back. |
+| **v5** — six gates `nop`ed | Made it *worse*: `ud_Tutorial.sav` went from `0x0002073e` (nine steps) to `0x0000003e` (five). Arming an object without making it local means it gets written from a state that was never restored. |
+| **now** — one instruction, in `ReloadAll` | The flag itself is set, so the twelve server objects take the exact path the five settings objects already take. |
 
 ### `ud_Spider2.sav` is dead code
 
@@ -209,12 +209,11 @@ accepts files up to 2 GB and does not count against that quota.
 
 - ✅ **Verified on device** (LiveContainer, iOS): the “Downloading profile”
   hang is gone; the game launches and plays offline.
-- 🔬 **Partially verified:** the three-gate build wrote 9 `ud_*.sav` files
-  instead of 6 — `QuestManager`, `Trophy`, `MCSkill`, `Tutorial` among them —
-  they survived a real relaunch, and the main menu appeared for the first
-  time. Story progress did not come back: 8 objects were still not armed.
-  The current build adds the two `ReloadAll` gates that caused that, and has
-  not been tested yet.
+- 🔬 **Not yet confirmed:** the local save patch. Three device snapshots
+  drove it to its current shape — see
+  [Device results](LOCAL_SAVE_DESIGN.md#device-results). The save format is
+  now fully decoded (`tools/decode_sav.py`), so the next test can be measured
+  rather than inferred.
 
 ### How to check the local save on device
 

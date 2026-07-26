@@ -8,9 +8,9 @@ the "do we need to download the profile?" decision at the single call site
 that leads to the spinner, routing the game to its own native UI_FIRST_CHECK
 state ("no profile to download") instead.
 
-Local save patch: three `cbz` instructions become `nop`, so all 17 save
-objects persist to local ud_<Name>.sav files through the game's own
-serialisers, instead of only the handful that were not server-backed. See
+Local save patch: one `cbz` in CSaveMgr::ReloadAll becomes a store that marks
+every save object locally-persisted, so all 17 use the same local file path
+the five settings objects already use. See
 LOCAL_SAVE_DESIGN.md. Disable with --no-local-save.
 
 Complementary patches: dead Gameloft hosts rewritten to .invalid, jailbreak
@@ -159,76 +159,51 @@ def patch_profile_skip(m):
 
 # --- local save -------------------------------------------------------------
 #
-# Every save object carries a byte at +0x25: "this object is persisted to a
-# local ud_<Name>.sav file". It defaults to 0 (the object constructor sets
-# +0x24 = 1 "server-persisted" and zeroes +0x25), and only a handful of
-# objects — settings, essentially — turn it on. Everything else travelled in
-# the Gameloft profile blob, which is why story progress vanishes offline.
+# Every save object carries a byte at +0x25: "persist me to a local
+# ud_<Name>.sav file". The manager's constructor sets +0x24 = 1
+# ("server-persisted") on all seventeen and +0x25 = 1 on only five of them --
+# the settings. Everything else, story progress included, travelled inside the
+# Gameloft profile blob, which is why it evaporates offline.
 #
-# Three branches read that byte and each one blocks a different half of local
-# persistence. Neutralising all three routes every object through the exact
-# code path the surviving settings already use, with the game's own
-# serialisers:
+# The five that have the flag work perfectly: their files are written, read
+# back and applied on every launch. So the fix is not to bypass the seven
+# branches that read the flag -- an earlier build did that, and produced
+# objects that were "armed" but still not local, a state the rest of the
+# machine never expects; on device it let a path overwrite a good
+# ud_Tutorial.sav with a regressed one.
 #
-#   save-all loop   CSaveMgr::Update    skips objects with +0x25 == 0
-#   write gate      SaveObj::Save       sends the blob to the upload queue
-#                                       instead of writing ud_<Name>.sav
-#   read gate       SaveObj::Reload     skips ReadFile() on reset/load
-#   reload-all      CSaveMgr::ReloadAll skips the object entirely
-#   reload-all read CSaveMgr::ReloadAll skips its ReadFile()
-#   self-reload     SaveObj::Load       skips its ReadFile() -- and the code
-#                                       just above has already cleared +0x30,
-#                                       +0x48 and +0x60, so the object is left
-#                                       wiped *and* unarmed
+# The faithful fix is to set the flag itself. CSaveMgr::ReloadAll already
+# walks all seventeen objects at session start, and already holds the constant
+# 1 in w25 (set at 0x10021bc64) with the object pointer in x20. Its first
+# instruction after loading the object is the very branch that skips
+# non-local objects:
 #
-# ReloadAll is what runs at session start (right after Constants.bin is
-# loaded) and again after every save-all. It is what arms an object: reset,
-# ReadFile, Load. An object it skips never becomes "state ready", so
-# SaveObj::Save refuses to write it — which is why patching only the first
-# three gates produced 9 files instead of 17.
+#     0x10021bc78   ldrb w8, [x20, #0x25]
+#     0x10021bc7c   cbz  w8, <next object>      ->  strb w25, [x20, #0x25]
 #
-# Its two gates must be patched together or not at all: the first one skips
-# the object, the second one skips only the read. Neutralising the first
-# alone would reset an object's state and then not read it back, wiping it.
+# Replacing that one branch with the store makes every object genuinely local
+# from session start onwards, so all seven original gates then pass on their
+# own -- including the one in SaveObj::Save at 0x1002126a4 that no NOP could
+# have fixed safely. Twelve objects become byte-for-byte equivalent in
+# treatment to the five that already work.
 #
-# Each site is `ldrb wT, [xN, #0x25]` followed by `cbz wT, <skip>`; those 8
-# bytes are unique in the whole __text section, so the patch self-locates.
-# The flag itself is left alone: if a profile ever arrives, the profile path
-# still behaves as designed.
-#
-# The self-reload gate tail-calls Load again after ReadFile, and that
-# recursion is bounded at exactly one level either way: ReadFile sets +0x2a on
-# both of its paths (file read at 0x100212020, file missing at 0x100211af4,
-# and the function has a single exit), so the re-entry takes the apply branch;
-# and even if +0x2a were somehow left clear, the re-entry falls straight out
-# at 0x100212424. There is no way for it to loop.
-#
-# A seventh site, 0x1002126ac in SaveObj::Save, is deliberately left alone. It
-# picks +0x48 instead of +0x30 as the document to build into while an object
-# sits in the upload slot (mgr+0xfa0). That is the game's own staging design —
-# the writer promotes +0x48 into +0x30 after each write — so forcing it would
-# clobber a buffer in flight. The cost of leaving it is at most a one-save lag
-# on one object at a time.
+# The eight bytes of `ldrb` + `cbz` are unique in the whole __text section, so
+# the patch self-locates.
 
-LOCAL_SAVE_SITES = [
-    ("save-all loop filter (CSaveMgr::Update)", bytes.fromhex("c8964039a8020034")),
-    ("local-write gate (SaveObj::Save)",        bytes.fromhex("6896403988030034")),
-    ("local-read gate (SaveObj::Reload)",       bytes.fromhex("68964039e8000034")),
-    ("object filter (CSaveMgr::ReloadAll)",     bytes.fromhex("88964039a8040034")),
-    ("read gate (CSaveMgr::ReloadAll)",         bytes.fromhex("88964039c8000034")),
-    ("self-reload gate (SaveObj::Load)",        bytes.fromhex("68964039a8060034")),
-]
-NOP = struct.pack("<I", 0xD503201F)
+LOCAL_SAVE_SITE = ("mark every save object local (CSaveMgr::ReloadAll)",
+                   bytes.fromhex("88964039a8040034"))
+# strb w25, [x20, #0x25]  -- w25 is 1 throughout the loop, x20 is the object
+LOCAL_SAVE_STORE = struct.pack("<I", 0x39009699)
 
 
 def patch_local_save(m):
     """
-    Neutralise the three "is this object persisted locally?" branches.
+    Turn ReloadAll's "skip non-local objects" branch into a store that marks
+    them local.
 
-    Returns (sites, error). `sites` is a list of (label, file_offset); `error`
-    is None on success or a message when the patch could not be applied
-    completely. A partial application would be worse than none — objects that
-    write a file nobody reads back, or vice versa — so the caller aborts.
+    Returns (sites, error): `sites` is a list of (label, file_offset), `error`
+    is None on success or a message when the site could not be located
+    unambiguously, in which case nothing is written.
     """
     base, size = arm64_slice_off(m)
     if base is None:
@@ -239,32 +214,29 @@ def patch_local_save(m):
     tx_addr, tx_off, tx_size = sects["__text"]
     text = bytes(m[tx_off:tx_off + tx_size])
 
-    done = []
-    for label, sig in LOCAL_SAVE_SITES:
-        hits = []
-        i = 0
-        while True:
-            i = text.find(sig, i)
-            if i < 0:
-                break
-            hits.append(i)
-            i += 1
-        if len(hits) != 1:
-            return done, f"{label}: expected 1 match, found {len(hits)}"
-        # the branch to neutralise is the second instruction of the signature
-        off = tx_off + hits[0] + 4
-        if (struct.unpack("<I", m[off:off + 4])[0] & 0xFF000000) != 0x34000000:
-            return done, f"{label}: second instruction is not a CBZ"
-        m[off:off + 4] = NOP
-        done.append((label, off))
-    return done, None
+    label, sig = LOCAL_SAVE_SITE
+    hits, i = [], 0
+    while True:
+        i = text.find(sig, i)
+        if i < 0:
+            break
+        hits.append(i)
+        i += 1
+    if len(hits) != 1:
+        return [], f"{label}: expected 1 match, found {len(hits)}"
+
+    off = tx_off + hits[0] + 4
+    if (struct.unpack("<I", m[off:off + 4])[0] & 0xFF000000) != 0x34000000:
+        return [], f"{label}: second instruction is not a CBZ"
+    m[off:off + 4] = LOCAL_SAVE_STORE
+    return [(label, off)], None
 
 
 def verify_local_save(data):
     """
-    Check an already-patched binary: each site must read as `ldrb` + `nop`,
-    and the original `ldrb` + `cbz` must be gone. Run against the binary that
-    actually ships, after it has been copied back into the bundle and rezipped.
+    Check an already-patched binary: the original branch must be gone and the
+    store must be present exactly once. Run against the binary that actually
+    ships, after it has been copied back into the bundle and rezipped.
     """
     base, size = arm64_slice_off(data)
     if base is None:
@@ -272,23 +244,13 @@ def verify_local_save(data):
     sects = arm64_sections(data, base)
     tx_addr, tx_off, tx_size = sects["__text"]
     text = bytes(data[tx_off:tx_off + tx_size])
+    label, sig = LOCAL_SAVE_SITE
     problems = []
-    for label, sig in LOCAL_SAVE_SITES:
-        if sig in text:
-            problems.append(f"{label}: original cbz still present")
-
-    # Two of the three sites share the very same `ldrb w8, [x19, #0x25]`, and
-    # both cbz become the same nop, so their patched forms are identical.
-    # Count per distinct ldrb encoding instead of per site.
-    expected = {}
-    for label, sig in LOCAL_SAVE_SITES:
-        expected.setdefault(sig[:4], []).append(label)
-    for ldrb, labels in expected.items():
-        n = text.count(ldrb + NOP)
-        if n != len(labels):
-            problems.append(
-                f"{' / '.join(labels)}: expected {len(labels)} patched "
-                f"site(s) for this ldrb, found {n}")
+    if sig in text:
+        problems.append(f"{label}: original cbz still present")
+    n = text.count(sig[:4] + LOCAL_SAVE_STORE)
+    if n != 1:
+        problems.append(f"{label}: expected 1 patched site, found {n}")
     return problems
 
 
@@ -363,8 +325,7 @@ def main():
             print(f"FAIL: {p}")
         if problems:
             return 1
-        print(f"local save verified: {len(LOCAL_SAVE_SITES)} sites patched in "
-              f"{args[0]}")
+        print(f"local save verified: {LOCAL_SAVE_SITE[0]} in {args[0]}")
         return 0
 
     if len(args) != 2:
@@ -399,10 +360,10 @@ def main():
             for label, off in ls_sites:
                 print(f"    (applied) {label} @ {off}")
         else:
-            print("\n>>> LOCAL SAVE patched: every save object now persists to "
-                  "ud_<Name>.sav")
+            print("\n>>> LOCAL SAVE patched: every save object is now marked "
+                  "locally-persisted")
             for label, off in ls_sites:
-                print(f"    cbz -> nop  @ file offset {off:<10} {label}")
+                print(f"    patched   @ file offset {off:<10} {label}")
     else:
         print("\n>>> local save patch skipped (--no-local-save)")
 
