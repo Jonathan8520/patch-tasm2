@@ -8,7 +8,7 @@ on:
         required: true
         default: "https://archive.org/download/the_amazing_spider_man_2_v1_3_1_ipa_1.3.1_ios_8.0/The_Amazing_Spider_Man_2_v1_3_1_ipa_1.3.1_ios_8.0.ipa"
       patch_flags:
-        description: "Extra flags for patch_tasm2.py (e.g. --persist-chapter)"
+        description: "Extra flags for patch_tasm2.py (e.g. --no-persist-chapter)"
         required: false
         default: ""
       release_tag:
@@ -88,8 +88,8 @@ jobs:
           strings "$BIN" | grep -E 'https?://[a-z0-9.-]*gameloft\.com' || echo "none : OK"
           echo "--- injected .invalid hosts ---"
           strings "$BIN" | grep -c 'invalid' || true
-          echo "--- local save patch, checked on the binary that ships ---"
-          python3 patch_tasm2.py --verify-local-save "$BIN"
+          echo "--- save patches, checked on the binary that ships ---"
+          python3 patch_tasm2.py --verify ${{ github.event.inputs.patch_flags }} "$BIN"
 
       - name: Publish the IPA as a Release
         uses: softprops/action-gh-release@v2
@@ -103,10 +103,18 @@ jobs:
             - Signature stripped (re-sign with LiveContainer / SideStore / Sideloadly)
             - Built by the `Patch TASM2 IPA` workflow (run #${{ github.run_number }})
 
-            Includes the local save patch: all 17 save objects now persist to
-            local `ud_<Name>.sav` files through the game's own serialisers,
-            instead of only the few that were not server-backed. Derived from
-            disassembly, not yet confirmed on a device — the README explains
-            how to check it in one snapshot.
+            Saving, offline:
+
+            - all 17 save objects persist to local `ud_<Name>.sav` files
+              through the game's own serialisers, instead of only the five
+              that were not server-backed;
+            - `ud_QuestManager.sav` now carries the **story chapter** in the
+              slot that used to hold the pending-mission id (always the
+              constructor's own -1). `chapter == 0` is what made the game
+              relaunch `story01_mission01` — the prologue — on every start.
+
+            **Delete `Documents/ud_QuestManager.sav` once** before the first
+            launch of this build: a file written by an earlier build holds -1
+            in that slot, which would now be read as the chapter.
           files: SpiderMan2_patched.ipa
           fail_on_unmatched_files: true

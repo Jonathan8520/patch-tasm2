@@ -3,11 +3,12 @@
 Patches the iOS build of **The Amazing Spider-Man 2 (1.3.1)** so it can be
 launched and played after Gameloft shut down its servers.
 
-**Scope, stated up front:** the game launches and plays offline, and its save
-objects are now persisted locally instead of to Gameloft's dead profile
-server — see [Local saving](#local-saving). Three device snapshots drove that
-patch to its current shape, and the save format is now fully decoded, so the
-next test can be measured rather than inferred.
+**Scope, stated up front:** the game launches and plays offline, its save
+objects are persisted locally instead of to Gameloft's dead profile server,
+and the story chapter — the field that made the prologue replay on every
+launch — is persisted with them. See [Local saving](#local-saving). Four
+device snapshots drove those patches to their current shape, and the save
+format is fully decoded, so every step was measured rather than inferred.
 
 ## The problem
 
@@ -76,8 +77,43 @@ ends** — no new save format, no injected code.
 
 The site is located by an 8-byte signature that occurs exactly once in
 `__text`; the patcher writes nothing if it is missing or ambiguous, and
-`--verify-local-save` re-checks the binary that actually ships. Pass
-`--no-local-save` to build without it.
+`--verify` re-checks the binary that actually ships. Pass `--no-local-save` to
+build without it.
+
+### Chapter patch (two instructions)
+
+Restoring the save objects is not enough on its own: the game still relaunched
+the prologue every time. The trigger is one 32-bit field, and it is not in any
+save object.
+
+```
+0x1001fc864   ldr  w8, [progressMgr, #0x2a4]   ; chapter
+0x1001fc868   cbnz w8, <normal flow>
+0x1001fc988   ... "story01_mission01"          ; the prologue = the tutorial
+```
+
+`chapter` **is** produced offline — `0x1001edd54` sets it on every mission
+completion, from the finished mission's own `"chapter"` data entry. It simply
+had nowhere to live between two launches.
+
+`ud_QuestManager.sav` persists two ints (`v=3`, confirmed on a real device
+file). The second one, `progressMgr+0x2dc`, is the pending-mission id: the
+constructor initialises it to `-1`, its only producer resets its source to
+`-1` straight after use, and its only consumer reads `-1` as "nothing
+pending". Every save stored the constructor default. So the slot now carries
+the chapter instead, on both sides:
+
+```
+0x1001ff4c8   ldr w1, [x20, #0x2dc]  ->  ldr w1, [x20, #0x2a4]     serialise
+0x1001ff594   str w0, [x19, #0x2dc]  ->  str w0, [x19, #0x2a4]     restore
+```
+
+Still two ints at version 3 — file format, length and version unchanged, with
+the game's own serialiser on both ends. Disable with `--no-persist-chapter`.
+
+> **Delete `Documents/ud_QuestManager.sav` once** before the first launch of a
+> build carrying this. A file written by an earlier build holds `-1` in that
+> slot, and it would now be read as the chapter.
 
 Full reasoning, the save-object layout and the decoded file format:
 [LOCAL_SAVE_DESIGN.md](LOCAL_SAVE_DESIGN.md).
@@ -127,8 +163,14 @@ objects that Gameloft kept server-side.
 | **v3** — patch `ldrb [x22,#0x25]` | That is `0x10021a1b4`, the save-all **loop filter** — one gate out of seven. Letting the loop reach `Save` changes nothing while `Save` still routes the blob to the upload queue. No file appeared, and the flag looked innocent. |
 | **v4** — three gates `nop`ed | 9 files instead of 6, and the main menu appeared for the first time. But 8 objects stayed silent, and progress did not come back. |
 | **v5** — six gates `nop`ed | Made it *worse*: `ud_Tutorial.sav` went from `0x0002073e` (nine steps) to `0x0000003e` (five). Arming an object without making it local means it gets written from a state that was never restored. |
-| **v6** — one instruction, in `ReloadAll` | The flag itself is set, so the twelve server objects take the exact path the five settings objects already take. **Verified on device: the save objects are written and restored correctly.** |
-| **v7** — `--persist-chapter` | Disproved by measurement: the field persists, but `chapter` is always 0 offline because only profile appliers ever write it. Off by default; do not enable. |
+| **v6** — one instruction, in `ReloadAll` | The flag itself is set, so the twelve server objects take the exact path the five settings objects already take. **Verified on device: the save objects are written and restored correctly.** A fourth snapshot then showed `ud_Tutorial.sav` coming back intact at `0x0002073e` — and the prologue still replaying, which ruled the tutorial bitmask out as the trigger. |
+| **v7** — chapter in `ud_QuestManager` | On by default. `chapter` was the trigger, and it is produced offline; it just had no slot. It takes over the pending-mission id, which was always the constructor's own `-1`. |
+
+An earlier version of this table recorded v7 as *disproved by measurement*.
+That was wrong: the build tested was run #19, whose job log shows only the
+main and local-save patches — the chapter flag was opt-in and was never
+passed. The `0` read back from that file was the pending-mission id, not a
+chapter.
 
 ### `ud_Spider2.sav` is dead code
 
@@ -160,8 +202,10 @@ it walks the same 17 objects, keyed `ud_<Name>`, and writes each blob into the
 were two sources feeding one sink. The patch simply keeps the sink fed from
 the local one.
 
-Still server-only: the profile's scalar fields (`chapter`, `finish_ch8`,
-`missionCount`, …). See
+`chapter` was the one field that had no sink at all; the chapter patch gives
+it one. Still without a local home: `finish_ch8` (`+0x2a8`, endgame only) and
+the profile's other scalars, which the local save objects `ud_Economy`,
+`ud_Item` and `ud_MCSkill` are expected to cover. See
 [LOCAL_SAVE_DESIGN.md](LOCAL_SAVE_DESIGN.md#what-is-not-covered).
 
 ## Replacing the server (branch `serveur-gameloft`)
@@ -210,30 +254,28 @@ accepts files up to 2 GB and does not count against that quota.
 
 - ✅ **Verified on device** (LiveContainer, iOS): the “Downloading profile”
   hang is gone; the game launches and plays offline.
-- 🔬 **Not yet confirmed:** the local save patch. Three device snapshots
-  drove it to its current shape — see
-  [Device results](LOCAL_SAVE_DESIGN.md#device-results). The save format is
-  now fully decoded (`tools/decode_sav.py`), so the next test can be measured
-  rather than inferred.
+- ✅ **Verified on device:** the local save patch. Four snapshots — see
+  [Device results](LOCAL_SAVE_DESIGN.md#device-results). The save objects are
+  written and read back correctly; `ud_Tutorial.sav` returned bit-identical at
+  `0x0002073e` across a relaunch.
+- 🔬 **Not yet confirmed:** the chapter patch. Every link in it is verified
+  statically against the disassembly and against a real `ud_QuestManager.sav`
+  (`v=3`, `(250454, -1)`), but it has not yet run on a device.
 
-### How to check the local save on device
+### How to check the chapter patch on device
 
-The same A/B/C protocol that settled the previous question works here, and
-one snapshot is enough to tell whether the write half works:
-
-1. Install the patched build, play past a checkpoint, force-quit.
-2. Look at the app's `Documents/`. Before this patch there were at most six
-   `ud_*.sav` files; **if the write half works, you should now see up to 17**,
-   with names you have not seen before.
-3. Relaunch and check whether progress is back.
-
-Three outcomes, each diagnostic:
+1. Delete `Documents/ud_QuestManager.sav` (**required once** — see above).
+   Leave everything else alone.
+2. Install the build, play the prologue **to the end**, force-quit.
+3. Relaunch.
 
 | What you see | What it means |
 |---|---|
-| ~17 `ud_*.sav` files, progress restored | done |
-| ~17 files, progress **not** restored | writes and arming work; the profile scalars are the remaining half — see [what is not covered](LOCAL_SAVE_DESIGN.md#what-is-not-covered) |
-| still ~9 files (no `ud_Economy`, `ud_Item`, `ud_FriendList`) | `ReloadAll` still is not arming them; start again at `0x10021bc7c` |
+| the prologue does **not** replay | done |
+| the prologue replays, and `ud_QuestManager.sav` reads `(n, 0)` | the chapter is being saved as 0 — the prologue's own data did not advance it, and the next place to look is `0x1001ed644` |
+| the prologue replays, and `ud_QuestManager.sav` reads `(n, k)` with `k > 0` | the save half works and the restore does not; look at the `ReloadAll` ordering |
+
+`tools/decode_sav.py Documents/ud_QuestManager.sav` prints those two ints.
 
 ## No-patch alternative
 

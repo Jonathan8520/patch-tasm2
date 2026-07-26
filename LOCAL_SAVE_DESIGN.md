@@ -177,8 +177,8 @@ which selects `+0x30` over `+0x48` as the document to build into and which no
 in treatment to the five that already work.
 
 The eight bytes of `ldrb` + `cbz` are unique in `__text`, so the patch
-self-locates, and `--verify-local-save` re-checks the binary that actually
-ships.
+self-locates, and `--verify` re-checks the binary that actually ships (both
+this patch and the chapter one).
 
 ### Why the flag is set here and not in the constructor
 
@@ -232,27 +232,59 @@ objects restore correctly. Nothing was destroyed.
 
 The tutorial still replayed, and the reason is a single 32-bit field.
 
-`chapter` lives at `progressMgr+0x2a4` (the manager at `[0x101074a30]`). It is
-written by exactly three functions, and every one of them is a profile
-applier:
+### The launch decision
 
-| Writer | What it is |
-|---|---|
-| `0x1001ed308` | a network response parser (`rewardsp`, `dailyCount`, `next_xp`, `chapter`) |
-| `0x10021bd60` | the in-`Update` profile applier |
-| `0x10021cef8` | `ApplyProfile` |
-
-**No local path ever writes it.** Offline it is always 0, and:
+`chapter` lives at `progressMgr+0x2a4` (the manager at `[0x101074a30]`), and
+`0x1001fc844` reads it to decide what to do at start:
 
 ```
 0x1001fc860   x8 = *(0x101074a30)
-0x1001fc864   w8 = x8->[0x2a4]        ; chapter
-0x1001fc868   cbnz w8, ...            ; non-zero -> carry on
-                                      ; zero     -> start from the beginning
+0x1001fc864   w8 = x8->[0x2a4]              ; chapter
+0x1001fc868   cbnz w8, 0x1001fc874          ; non-zero -> normal flow
+0x1001fc86c   w8 = x8->[0x1bd]              ; "prologue already left" (runtime only)
+0x1001fc870   cbz  w8, 0x1001fc95c
+   ...
+0x1001fc988   "story01_mission01"           ; the prologue -- i.e. the tutorial
+0x1001fc9a0   bl <request level>
 ```
 
-while `0x1001f25d8` turns it into `chapter >= 8 ? 0 : chapter + 1` — the
-prologue.
+**`chapter == 0` is the trigger.** Not the tutorial bitmask: the fourth
+snapshot has `ud_Tutorial.sav` restored intact at `0x0002073e` and the
+prologue still launches. The two flags at `+0x1bd` / `+0x1bf` are runtime
+state on the game-mode object, reset every launch.
+
+That `chapter` is the story cursor, and that 0 means the prologue, is
+confirmed three independent ways:
+
+| Where | What it shows |
+|---|---|
+| `0x1001f2ac0` | bounds `chapter - 1` to `0..7` → `chapter ∈ {0, 1..8}` |
+| `0x10021deb0` | `chapter == 0` → `UI_prologue_progress_2`, else `UI_chapter_progress` |
+| `0x100215afc` | the profile mirrors it as `_ca = "ch<N>"` |
+
+### It *is* produced locally
+
+The earlier claim in this file — that only profile appliers write `chapter` —
+was wrong, and it came from a sweep that only followed `adrp`+`ldr` pairs in
+one register. A full `__text` sweep of every `str w*, [x*, #0x2a4]` finds four
+writers, and one of them is pure gameplay:
+
+| Writer | What it is |
+|---|---|
+| **`0x1001edd54`** | **mission completion** — takes the finished mission's own `"chapter"` entry (`0x1001ed644`, `map::operator[]` on the mission-result map) and stores it |
+| `0x1001ff530` | the legacy `v0`/`v1` deserialise branch (nothing writes such a stream) |
+| `0x10021bf84` | the in-`Update` profile applier — behind `HasMember("_ca")` |
+| `0x10021d134` | `ApplyProfile` — behind `HasMember("_ca")` |
+
+Both profile appliers are guarded, and offline the document they are handed is
+built from `mgr[0xa28]`, an empty `std::map`, so neither ever fires. Finishing
+a mission, on the other hand, sets `chapter` from the game's own data files —
+**offline, correctly, with no server involved.**
+
+The value is therefore computed locally and lost locally: nothing writes it to
+disk, so every launch starts again from 0.
+
+### The fix: give it the slot that was already wasted
 
 `ud_QuestManager` persists exactly two ints, through a helper pair called from
 nowhere else in the binary:
@@ -262,44 +294,56 @@ nowhere else in the binary:
 0x1001ff4dc  deserialise  version 3 reads them straight back
 ```
 
-`+0x2dc` is the current mission id; `-1` means "none", and at that point
-`0x1001f96f4` falls back to reading `chapter`. A save taken between missions
-therefore holds `(mission = -1, chapter = 0)` and has nothing to resume from —
-which is exactly the `(250454, -1)` in the device data.
+and the device file agrees: `v=3`, 8-byte payload, `(250454, -1)`.
 
-The legacy `v0`/`v1` branch of that same deserialiser *does* read `+0x2a4`.
-Gameloft moved the chapter out of the local format when they moved it to the
-server.
+**The second slot is worth nothing.** `+0x2dc` is the pending-mission id:
 
-### `--persist-chapter` — tried, measured, and wrong
+- the constructor initialises it to `-1` (`0x1001f6910`: `mov x11, #-1` →
+  `str x11, [x19+0x2dc]`, covering `+0x2dc` and `+0x2e0`);
+- its only producer, `0x10020a1dc`, copies it out of `[x19+0x3c4]` and
+  immediately resets that source to `-1`;
+- its only consumer, `0x1001f96e8`, treats `-1` as "nothing pending".
 
-Two 4-byte edits swap the second persisted field for the chapter on both
-sides:
+So every save stored the constructor default, and *not* restoring it leaves it
+at exactly the value it was being restored to. Two 4-byte edits hand the slot
+to the chapter, on both sides:
 
 ```
 0x1001ff4c8   ldr w1, [x20, #0x2dc]  ->  ldr w1, [x20, #0x2a4]
 0x1001ff594   str w0, [x19, #0x2dc]  ->  str w0, [x19, #0x2a4]
 ```
 
-It works exactly as designed, and that is how it was disproved. A device run
-completed the tutorial with this build and produced
+Still two ints, still version 3: the file format, its length and its version
+byte are all unchanged, and the game's own serialiser sits on both ends.
+
+`ReloadAll` reaches the restore: at `0x10021bcdc` it re-tests `+0x25` — which
+the local-save patch has just set — then calls `ReadFile` (`0x1002119ac`) and
+`Load` (`0x100212080`), which dispatches to this object's `Restore`. The
+progress manager is already constructed at that point; the unpatched restore
+path already dereferences it to write `+0x2d8`, and does so on device without
+crashing.
+
+**One-time caveat.** A `ud_QuestManager.sav` written by an earlier build holds
+`-1` in that slot, and after the patch it would be read as `chapter = -1`.
+Delete that one file before the first launch of a build carrying this patch;
+everything else in `Documents` can stay.
+
+#### Why the earlier "disproof" was not one
+
+This file previously recorded `--persist-chapter` as *tried, measured and
+wrong*, on the strength of a device run that produced `(250454, 0)`. That run
+never carried the patch. The job log for workflow run #19 — the build that was
+installed — lists only
 
 ```
-ud_QuestManager.sav   (250454, 0)      was (250454, -1)
+>>> LOCAL SAVE patched: every save object is now marked locally-persisted
+>>> MAIN PATCH applied: skip UI_DOWNLOADING_PROFILE -> UI_FIRST_CHECK
 ```
 
-The second slot now genuinely carries `chapter` — **and `chapter` is 0.** It
-was always going to be. Its only three writers are profile appliers, so
-nothing offline ever advances it; persisting it stores a zero, and the cost is
-the current-mission id it displaced.
-
-**Do not enable this.** The flag is kept in the patcher only so the experiment
-is reproducible, and it stays off by default.
-
-The wider point it settles: story progression was **server-authoritative**.
-The client reports events and the server maintained `chapter`,
-`missionCount` and `finish_ch8`. No amount of local persistence recovers a
-counter the client never computes.
+with no chapter lines: the flag was opt-in and was not passed. The `0` in that
+file was `+0x2dc`, not a chapter. The conclusion drawn from it —
+that story progression was server-authoritative — does not follow, and
+`0x1001edd54` shows it is false.
 
 ### A quirk worth recording
 
@@ -356,11 +400,17 @@ objects to 17.
 
 ## What is not covered
 
-The profile scalars (`chapter`, `finish_ch8`, `missionCount`, …) have no local
-file. They are only ever restored by `ApplyProfile`, which needs a document.
-Whether that matters depends on something static analysis could not settle
-cheaply: whether gameplay recomputes those counters from the restored save
-objects, or reads them as the source of truth.
+`chapter` now has a home. The other profile scalars still do not:
+
+| Field | Where it is | Consequence offline |
+|---|---|---|
+| `finish_ch8` (`+0x2a8`) | written by four gameplay paths (`0x1001f7448`, `0x1001f8738`, `0x1003c4758`, `0x1003c52e0`), read at `0x100333398` | endgame flag resets; only matters past chapter 8 |
+| `missionCount`, `xp`, `coins`, `inventory`, skills | mirrored in the profile, but the save objects `ud_Economy`, `ud_Item`, `ud_MCSkill` carry them too — and those are local now | expected to survive; unconfirmed on device |
+
+There is no room for a second scalar in `ud_QuestManager`: its serialiser is
+thirteen instructions with no padding after it, so adding a third `WriteInt`
+would need a code cave and relocated calls. If a device test shows a specific
+counter reading wrong, that is the point at which it becomes worth doing.
 
 There is one encouraging data point. Every one of the 28 derived save-object
 vtables overrides both serialise slots (`+0x18`, `+0x28`) with real code — the

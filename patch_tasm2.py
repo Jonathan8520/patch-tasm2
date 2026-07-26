@@ -10,8 +10,12 @@ state ("no profile to download") instead.
 
 Local save patch: one `cbz` in CSaveMgr::ReloadAll becomes a store that marks
 every save object locally-persisted, so all 17 use the same local file path
-the five settings objects already use. See
-LOCAL_SAVE_DESIGN.md. Disable with --no-local-save.
+the five settings objects already use. Disable with --no-local-save.
+
+Chapter patch: ud_QuestManager's second persisted int is the pending-mission
+id, which is always the constructor's own -1 and therefore worth nothing. It
+carries the story chapter instead, so the game stops relaunching the prologue
+on every start. Disable with --no-persist-chapter. See LOCAL_SAVE_DESIGN.md.
 
 Complementary patches: dead Gameloft hosts rewritten to .invalid, jailbreak
 detection paths and function neutralised. Every edit preserves string and
@@ -254,41 +258,79 @@ def verify_local_save(data):
     return problems
 
 
+def verify_chapter(data):
+    """
+    Same, for the chapter patch: both original words must be gone and both
+    rewritten words present exactly once, in the same instruction pair.
+    """
+    base, size = arm64_slice_off(data)
+    if base is None:
+        return ["no arm64 slice"]
+    sects = arm64_sections(data, base)
+    tx_addr, tx_off, tx_size = sects["__text"]
+    text = bytes(data[tx_off:tx_off + tx_size])
+    problems = []
+    for label, sig, idx, word in CHAPTER_SITES:
+        if sig in text:
+            problems.append(f"{label}: original instruction still present")
+        patched = bytearray(sig)
+        patched[idx * 4:idx * 4 + 4] = struct.pack("<I", word)
+        n = text.count(bytes(patched))
+        if n != 1:
+            problems.append(f"{label}: expected 1 patched site, found {n}")
+    return problems
+
+
 # --- chapter persistence ----------------------------------------------------
 #
-# The local save format cannot carry the story cursor. `chapter` lives at
-# progressMgr+0x2a4 (the manager at [0x101074a30]) and is written by exactly
-# three functions -- 0x1001ed308, 0x10021bd60 and ApplyProfile -- every one of
-# them a profile/network applier. No local path ever writes it, so offline it
-# is always 0, and 0x1001fc844 reads it as "start from the beginning" while
-# 0x1001f25d8 turns it into chapter 1. That is why the prologue replays on
-# every launch, however well the save objects themselves are restored.
+# This is what makes the tutorial replay on every launch, and no amount of
+# save-object restoring can fix it, because the value is not in a save object.
 #
-# ud_QuestManager persists exactly two ints, through a helper pair used by
-# nothing else in the binary:
+# `chapter` is progressMgr+0x2a4 (the manager at [0x101074a30]); 0 means the
+# prologue and 1..8 the story chapters (0x1001f2ac0 bounds `chapter - 1` to
+# 0..7; the profile mirrors it as the string "ch<N>"; the progress UI picks
+# UI_prologue_progress_2 when it is 0 and UI_chapter_progress otherwise).
+#
+# The launch decision is at 0x1001fc844:
+#
+#     ldr  w8, [progressMgr, #0x2a4]     ; chapter
+#     cbnz w8, <normal flow>
+#     ...  "story01_mission01"           ; the prologue -- i.e. the tutorial
+#
+# Exactly one gameplay path writes it: 0x1001edd54, at mission completion,
+# from the finished mission's own "chapter" entry (0x1001ed644). The only
+# other writers are the two profile appliers (0x10021bf84, 0x10021d134), both
+# behind HasMember("_ca"), which offline is never true. So the value is
+# produced locally and correctly during play -- it simply has nowhere to live
+# between two launches, and every launch starts again from 0.
+#
+# ud_QuestManager is where it can live. That object persists exactly two ints
+# through a helper pair called from nowhere else in the binary:
 #
 #     0x1001ff4a8  serialise    writes progressMgr+0x2d8, then +0x2dc
 #     0x1001ff4dc  deserialise  version 3 reads them back into the same two
 #
-# +0x2dc is the current mission id, and -1 means "none" -- at which point
-# 0x1001f96f4 falls back to reading `chapter`. A save taken between missions
-# therefore holds (mission = -1, chapter = 0) and has nothing to resume from.
+# and a real device file confirms version 3 with an 8-byte payload.
 #
-# So swap the second field for the chapter on both sides. It stays two ints at
-# version 3, so the file format and its length are unchanged. The cost is that
-# a save taken *during* a mission restarts that mission rather than resuming
-# mid-way; the gain is that the chapter survives, which is the thing actually
-# blocking.
+# The second slot is worth nothing. +0x2dc is the pending-mission id; its only
+# producer (0x10020a1dc) copies it out of a field it immediately resets to -1,
+# and the constructor already initialises +0x2dc to -1 (0x1001f6910-0x1001f6914).
+# Every save therefore stored -1 -- the constructor default. Not restoring it
+# leaves it at exactly the value it was being restored to.
 #
-# Not enabled by default: it changes what the second int means, so an existing
-# ud_QuestManager.sav would be misread (its -1 would land in `chapter`).
-# Delete that file once before running a build that carries this.
+# So the second slot carries `chapter` on both sides instead. Two four-byte
+# edits, still two ints at version 3: file format, length and version all
+# unchanged, with the game's own serialiser on both ends.
+#
+# One-time caveat: a ud_QuestManager.sav written by an earlier build holds the
+# old -1 in that slot, which would land in `chapter`. Delete that one file
+# before the first launch of a build carrying this patch.
 
 CHAPTER_SITES = [
-    ("serialise chapter instead of current mission (0x1001ff4c8)",
-     bytes.fromhex("81de42b9e00313aa"), 0, 0xB942A681),
-    ("restore chapter instead of current mission (0x1001ff594)",
-     bytes.fromhex("60de02b910000014"), 0, 0xB902A660),
+    ("serialise chapter instead of pending mission (0x1001ff4c8)",
+     bytes.fromhex("81de42b9e00313aa"), 0, 0xB942A681),   # ldr w1,[x20,#0x2a4]
+    ("restore chapter instead of pending mission (0x1001ff594)",
+     bytes.fromhex("60de02b910000014"), 0, 0xB902A660),   # str w0,[x19,#0x2a4]
 ]
 
 
@@ -324,7 +366,7 @@ def patch_chapter_persist(m):
     return done, None
 
 
-def patch(data, local_save=True, chapter=False):
+def patch(data, local_save=True, chapter=True):
     m = bytearray(data)
     patches = []
     pat = re.compile(rb"[\x20-\x7e]{6,130}")
@@ -390,24 +432,36 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = {a for a in sys.argv[1:] if a.startswith("--")}
 
-    if "--verify-local-save" in flags:
+    local_save = "--no-local-save" not in flags
+    chapter = "--no-persist-chapter" not in flags
+
+    if flags & {"--verify", "--verify-local-save"}:
         if len(args) != 1:
-            print("usage: patch_tasm2.py --verify-local-save <patched_binary>")
+            print("usage: patch_tasm2.py --verify [--no-local-save] "
+                  "[--no-persist-chapter] <patched_binary>")
             return 1
-        problems = verify_local_save(open(args[0], "rb").read())
+        data = open(args[0], "rb").read()
+        problems, checked = [], []
+        if local_save:
+            problems += verify_local_save(data)
+            checked.append(LOCAL_SAVE_SITE[0])
+        if chapter and "--verify-local-save" not in flags:
+            problems += verify_chapter(data)
+            checked += [label for label, _s, _i, _w in CHAPTER_SITES]
         for p in problems:
             print(f"FAIL: {p}")
         if problems:
             return 1
-        print(f"local save verified: {LOCAL_SAVE_SITE[0]} in {args[0]}")
+        print(f"verified in {args[0]}:")
+        for c in checked:
+            print(f"  ok  {c}")
         return 0
 
     if len(args) != 2:
-        print("usage: patch_tasm2.py [--no-local-save] [--persist-chapter] "
+        print("usage: patch_tasm2.py [--no-local-save] [--no-persist-chapter] "
               "<input_binary> <output_binary>")
-        print("       patch_tasm2.py --verify-local-save <patched_binary>")
+        print("       patch_tasm2.py --verify <patched_binary>")
         return 1
-    local_save = "--no-local-save" not in flags
 
     data = open(args[0], "rb").read()
 
@@ -426,7 +480,6 @@ def main():
         name = {2: "MH_EXECUTE", 6: "MH_DYLIB"}.get(ft, str(ft))
         print(f"  {label:6} off={off:<10} size={size:<10} filetype={name}")
 
-    chapter = "--persist-chapter" in flags
     out, patches, jb, fn_ok, skip_ok, skip_off, ls_sites, ls_err, ch_sites, ch_err = \
         patch(data, local_save=local_save, chapter=chapter)
 
@@ -434,10 +487,13 @@ def main():
         if ch_err:
             print(f"\n>>> ERROR: chapter persistence NOT applied: {ch_err}")
         else:
-            print("\n>>> CHAPTER persistence patched: ud_QuestManager now carries "
-                  "progressMgr+0x2a4")
+            print("\n>>> CHAPTER patched: ud_QuestManager now carries "
+                  "progressMgr+0x2a4 (story chapter)")
             for label, off in ch_sites:
-                print(f"    @ file offset {off:<10} {label}")
+                print(f"    patched   @ file offset {off:<10} {label}")
+    else:
+        print("\n>>> chapter patch skipped (--no-persist-chapter): the prologue "
+              "will replay on every launch")
 
     if local_save:
         if ls_err:
