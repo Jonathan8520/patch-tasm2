@@ -475,8 +475,18 @@ def patch_chapter_persist(m):
 PROLOGUE_SITES = [
     ("never re-request the prologue (0x1001fc868)",
      bytes.fromhex("6800003568f64639"), 0, 0x14000003),          # b +0xc
-    ("never wipe the tutorial bitmask (0x1003cc5f4)",
+    ("never wipe the tutorial bitmask on restore (0x1003cc5f4)",
      bytes.fromhex("66b3f897a0000034e00314aa"), 1, 0xD503201F),  # nop
+    # CTutorialMgr::Reset is `str wzr,[x0,#4] ; ret` -- it zeroes the whole
+    # bitmask. Its single caller is the tail of the script dispatcher at
+    # 0x1001205ec, i.e. the game's own scripts ask for it, and one of them runs
+    # every time the opening sequence plays: the restore puts 137022 back and
+    # the script wipes it to 0 seconds later, which is exactly the 137022 -> 62
+    # seen on device with the deserialiser already patched. Neutralise the
+    # store and the method becomes a no-op, so nothing can discard tutorial
+    # progress once it is earned.
+    ("neuter CTutorialMgr::Reset (0x1003cc5b8)",
+     bytes.fromhex("c0035fd61f0400b9c0035fd6080440b9"), 1, 0xD503201F),  # nop
 ]
 
 
