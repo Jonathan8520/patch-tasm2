@@ -296,7 +296,7 @@ accepts files up to 2 GB and does not count against that quota.
 |---|---|
 | the prologue does **not** replay | done |
 | the prologue replays, `ud_QuestManager.sav` reads `(n, 1)` | the value is stored and restored, so something other than the chapter gates the request — back to `0x1001fc844` |
-| the prologue replays, `ud_QuestManager.sav` reads `(n, 0)` | `0x1001ed308` never ran, so the mission was not registered as completed at all |
+| the prologue replays, `ud_QuestManager.sav` reads `(n, 0)` | **the executable under test is not this build.** The serialiser writes the constant 1 into that slot unconditionally; a 0 can only come from a binary that lacks the patch. Delete the app from LiveContainer and install the IPA fresh rather than over the top |
 
 `tools/decode_sav.py Documents/ud_QuestManager.sav` prints those two ints, and
 `tools/sav-reader.html` does the same on the device itself.

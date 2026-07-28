@@ -330,9 +330,17 @@ def verify_chapter(data):
 # old -1 in that slot, which would land in `chapter`. Delete that one file
 # before the first launch of a build carrying this patch.
 
+# The serialiser writes a constant rather than reading the field, and that is
+# deliberate. Offline the chapter can only ever be 0 or 1 -- nothing produces
+# anything else -- so `mov w1, #1` is exactly `max(chapter, 1)` with one
+# instruction, and unlike a read it cannot lose a race with the flush. The
+# object is written when the save manager next sees it dirty, which need not be
+# after the mission-completion store; storing the constant removes that ordering
+# question entirely. Revisit if a real chapter advance ever exists.
+
 CHAPTER_SITES = [
-    ("serialise chapter instead of pending mission (0x1001ff4c8)",
-     bytes.fromhex("81de42b9e00313aa"), 0, 0xB942A681),   # ldr w1,[x20,#0x2a4]
+    ("serialise at least chapter 1 instead of the pending mission (0x1001ff4c8)",
+     bytes.fromhex("81de42b9e00313aa"), 0, 0x52800021),   # mov w1,#1
     ("restore chapter instead of pending mission (0x1001ff594)",
      bytes.fromhex("60de02b910000014"), 0, 0xB902A660),   # str w0,[x19,#0x2a4]
 ]

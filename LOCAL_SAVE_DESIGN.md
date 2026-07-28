@@ -324,6 +324,42 @@ its neighbouring `adrp` occur exactly once in `__text`. A completed mission
 now sets the chapter to 1; nothing else offline writes the field, so it stays
 1 — monotone and never regressing.
 
+### And the serialiser writes the constant, not the field
+
+A second device run, on the build carrying the edit above, still produced
+`(250454, 0)`. Two readings survive that measurement, and the save files alone
+cannot separate them:
+
+1. the binary under test did not carry the edit (an install that kept the old
+   executable would look exactly like this — the two runs are byte-identical
+   in every decoded field);
+2. the object was flushed at a moment when the chapter was still 0.
+
+Reading 2 is not obviously available: `+0x2d8` and `+0x2a4` are written three
+instructions apart, `+0x2d8` from inside the callee at `0x1001edd48` and
+`+0x2a4` right after it returns, with no call between them, so no flush can
+land in the gap. If the `250454` in the file was produced by that event, the
+chapter beside it is whatever `w20` held. It can only be reading 2 if the
+`250454` came from restoring an earlier file instead.
+
+Rather than spend another device run separating them, the serialiser stops
+reading the field:
+
+```
+0x1001ff4c8   ldr w1, [x20, #0x2a4]   ->   mov w1, #1
+```
+
+Offline the chapter is only ever 0 or 1, so a constant 1 *is* `max(chapter, 1)`
+— and unlike a read it cannot lose a race with the flush. The saved file then
+reports chapter 1 from its first write onward, whatever the ordering, which
+makes the next measurement decisive: `(n, 1)` means the build is running and
+the mechanism holds; `(n, 0)` can then only mean the executable under test is
+not this one.
+
+The cost is that the local save can no longer carry a chapter above 1. Nothing
+offline produces one, so nothing is lost today; it is the first thing to undo
+if a real chapter advance is ever built.
+
 Conservative on purpose. `min(chapter + 1, 8)` per completed mission would
 reach the last chapter in eight missions, side missions included, because
 which mission belongs to which chapter lived in the server's answer and in the
