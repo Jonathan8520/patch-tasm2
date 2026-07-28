@@ -538,6 +538,64 @@ def _verify_sites(data, sites):
     return problems
 
 
+# --- letting the local profile reach disk ----------------------------------
+#
+# This is the one that matters, and the game already contains the machinery.
+#
+# progressMgr+0x50 is not an HTTP client in this build: it is a local mission
+# server (0x100416000..0x100422000) that reads the bundled ch0.json..ch8.json
+# and synthesises the very answers Gameloft's server used to send. Request 0x16
+# fills the whole RAM mission cursor -- progressMgr+0x110, a
+# std::map<std::string,std::vector<int>> keyed "mm"/"sm"/"prm"/"rm" -- by
+# reading profile["_ca"] == "chN" and indexing chapters[N] (0x100417cb4 ..
+# 0x100417cf4). Request 0x15 ("mission finished") advances profile["_ca"] to
+# chapterDoc["nc"] at 0x10041b308. The whole story cursor is computed offline.
+#
+# Its state lives in save object 16 (mgr+0x970, SaveIndex 16, version 2, ctor
+# 0x1002157bc): the profile document itself. And that one object is the only
+# one in the binary the writer refuses to write:
+#
+#     0x100211620   ldr  w8, [x19, #0x1c]      ; SaveIndex
+#     0x100211624   cmp  w8, #0x10             ; == 16 ?
+#     0x100211628   b.ne <normal write>
+#     0x100211634   ldr  w8, [saveMgr, #0xfc8]
+#     0x100211638   and  w8, w8, #0xff00ff     ; bytes +0xfc8 and +0xfca
+#     0x10021163c   cbz  w8, <exit without writing anything>
+#
+# +0xfc8 is "did this file already exist when the manager was constructed"
+# (0x100218e28 fopen "rb" -> 0x100218e34 / 0x100218e40), and +0xfca is
+# "the cloud profile was touched", set only at 0x10021d878 and 0x10021da18,
+# both dead offline. So on a clean install both are 0, the file is never
+# written, and because it is never written it never exists: a closed loop.
+#
+# The consequence is exactly the symptom. Object 16's Reset (0x100215948)
+# rebuilds a default profile whose chapter is the literal "ch0" (0x100215b10),
+# ReloadAll then finds no file to override it, request 0x16 loads ch0.json, and
+# the opening story mission is offered again. Every launch. Forever.
+#
+# One instruction opens the loop. The read-back side already runs for object 16
+# unconditionally (0x10021a9c4 at boot, 0x10021bce8 in ReloadAll; 0x1002119ac
+# has no SaveIndex gate), so nothing new is enabled -- the file simply starts
+# existing, after which +0xfc8 is set at construction and the gate would pass on
+# its own.
+#
+# Measured on this binary: the `cbz` word alone occurs 7 times in __text, the
+# `and`+`cbz` pair exactly once.
+
+PROFILE_SAVE_SITES = [
+    ("let the local profile object reach disk (0x10021163c)",
+     bytes.fromhex("089d0012a8100034"), 1, 0xD503201F),   # nop
+]
+
+
+def patch_profile_save(m):
+    return _apply_sites(m, PROFILE_SAVE_SITES, "profile save")
+
+
+def verify_profile_save(data):
+    return _verify_sites(data, PROFILE_SAVE_SITES)
+
+
 def patch_prologue(m):
     return _apply_sites(m, PROLOGUE_SITES, "prologue override")
 
@@ -546,7 +604,8 @@ def verify_prologue(data):
     return _verify_sites(data, PROLOGUE_SITES)
 
 
-def patch(data, local_save=True, chapter=True, prologue=True):
+def patch(data, local_save=True, chapter=True, prologue=True,
+          profile_save=True):
     m = bytearray(data)
     patches = []
     pat = re.compile(rb"[\x20-\x7e]{6,130}")
@@ -607,8 +666,11 @@ def patch(data, local_save=True, chapter=True, prologue=True):
     # --- optional: override the prologue decision outright ---
     pr_sites, pr_err = patch_prologue(m) if prologue else ([], None)
 
+    # --- optional: let the local profile object reach disk ---
+    ps_sites, ps_err = patch_profile_save(m) if profile_save else ([], None)
+
     return (bytes(m), patches, jb, fn_ok, skip_ok, skip_off, ls_sites, ls_err,
-            ch_sites, ch_err, pr_sites, pr_err)
+            ch_sites, ch_err, pr_sites, pr_err, ps_sites, ps_err)
 
 
 def main():
@@ -618,6 +680,7 @@ def main():
     local_save = "--no-local-save" not in flags
     chapter = "--no-persist-chapter" not in flags
     prologue = "--no-force-prologue-skip" not in flags
+    profile_save = "--no-profile-save" not in flags
 
     if flags & {"--verify", "--verify-local-save"}:
         if len(args) != 1:
@@ -636,6 +699,9 @@ def main():
         if prologue and "--verify-local-save" not in flags:
             problems += verify_prologue(data)
             checked += [label for label, _s, _i, _w in PROLOGUE_SITES]
+        if profile_save and "--verify-local-save" not in flags:
+            problems += verify_profile_save(data)
+            checked += [label for label, _s, _i, _w in PROFILE_SAVE_SITES]
         for p in problems:
             print(f"FAIL: {p}")
         if problems:
@@ -647,7 +713,8 @@ def main():
 
     if len(args) != 2:
         print("usage: patch_tasm2.py [--no-local-save] [--no-persist-chapter] "
-              "[--no-force-prologue-skip] <input_binary> <output_binary>")
+              "[--no-force-prologue-skip] [--no-profile-save] "
+              "<input_binary> <output_binary>")
         print("       patch_tasm2.py --verify <patched_binary>")
         return 1
 
@@ -669,8 +736,20 @@ def main():
         print(f"  {label:6} off={off:<10} size={size:<10} filetype={name}")
 
     out, patches, jb, fn_ok, skip_ok, skip_off, ls_sites, ls_err, ch_sites, \
-        ch_err, pr_sites, pr_err = \
-        patch(data, local_save=local_save, chapter=chapter, prologue=prologue)
+        ch_err, pr_sites, pr_err, ps_sites, ps_err = \
+        patch(data, local_save=local_save, chapter=chapter, prologue=prologue,
+              profile_save=profile_save)
+
+    if profile_save:
+        if ps_err:
+            print(f"\n>>> ERROR: profile save NOT applied: {ps_err}")
+        else:
+            print("\n>>> PROFILE SAVE patched: the local mission server's profile "
+                  "is now written to disk")
+            for label, off in ps_sites:
+                print(f"    patched   @ file offset {off:<10} {label}")
+    else:
+        print("\n>>> profile save skipped (--no-profile-save)")
 
     if prologue:
         if pr_err:
@@ -746,6 +825,10 @@ def main():
 
     if prologue and pr_err:
         print("ERROR: prologue override incomplete, aborting")
+        return 1
+
+    if profile_save and ps_err:
+        print("ERROR: profile save incomplete, aborting")
         return 1
 
     if local_save and ls_err:

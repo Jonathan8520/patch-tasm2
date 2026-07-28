@@ -163,6 +163,45 @@ behaviour.
 Full reasoning, the save-object layout and the decoded file format:
 [LOCAL_SAVE_DESIGN.md](LOCAL_SAVE_DESIGN.md).
 
+### Profile save patch (one instruction)
+
+The mission cursor never needed reconstructing. `progressMgr+0x50` is not an
+HTTP client in this build — it is a **local mission server**
+(`0x100416000..0x100422000`) that reads the bundled `ch0.json … ch8.json` and
+synthesises the answers the Gameloft server used to send. Request `0x16` fills
+the whole RAM cursor (`progressMgr+0x110`, a
+`std::map<std::string,std::vector<int>>` keyed `"mm"`/`"sm"`/`"prm"`/`"rm"`) by
+reading `profile["_ca"] == "chN"` and indexing `chapters[N]`; request `0x15`
+advances `profile["_ca"]` to `chapterDoc["nc"]` at `0x10041b308`.
+
+That profile is save object 16 — and it is the only object in the binary the
+writer refuses to write:
+
+```
+0x100211620   ldr  w8, [x19, #0x1c]      ; SaveIndex
+0x100211624   cmp  w8, #0x10             ; == 16 ?
+0x100211628   b.ne <normal write>
+0x100211634   ldr  w8, [saveMgr, #0xfc8]
+0x100211638   and  w8, w8, #0xff00ff
+0x10021163c   cbz  w8, <exit without writing>   ->   nop
+```
+
+`+0xfc8` is *"did this file already exist when the manager was constructed"*
+(`0x100218e28` `fopen "rb"`), `+0xfca` is *"the cloud profile was touched"*, set
+only on two dead-offline paths. Clean install ⇒ both 0 ⇒ never written ⇒ never
+exists. A closed loop, and the reason object 16's `Reset` default of `"ch0"`
+(`0x100215b10`) is what the game starts from every single launch.
+
+The read-back side already runs for object 16 unconditionally, so the `nop`
+enables no new code path: the file simply starts existing. Disable with
+`--no-profile-save`.
+
+> Two consequences worth knowing. A `ud_*.sav` you have never seen appears in
+> `Documents` — its name comes from a runtime config lookup, so it cannot be
+> derived from the binary. And the whole short-key profile now carries over,
+> not just the chapter: if it ever holds a bad value, deleting that one file
+> resets it.
+
 ### Complementary patches
 
 Dead Gameloft hostnames are rewritten to `.invalid` (RFC 6761: never
@@ -213,6 +252,8 @@ objects that Gameloft kept server-side.
 | **v8** — produce the chapter locally | `mov w20, #1` at `0x1001edd28`. The chapter was never computed offline at all; the map it came from is filled only by the *mission finished* HTTP response. One instruction supplies the value the server used to. |
 | **v9** — write the chapter as a constant | Measured `(250454, 1)`: the save half is proven. |
 | **v10** — override the prologue decision | The chapter is saved and still does not come back. Both readers of it — the launch check and the tutorial deserialiser — stop consulting it. |
+| **v11** — neuter `CTutorialMgr::Reset` | Measured: `ud_Tutorial.sav` holds at 132926 across a relaunch instead of falling to 62. The tutorial bitmask persists — and the story mission still restarted, which is what pointed at the real cause. |
+| **v12** — let the profile object reach disk | The mission cursor was never missing: the game contains a **local mission server** that computes it from the bundled `chN.json`. Its state is save object 16, the one object the writer is forbidden to write. One `nop` opens the loop. |
 
 Two corrections this table has had to make, both from device data rather than
 from reading:
