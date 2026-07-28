@@ -92,9 +92,26 @@ save object.
 0x1001fc988   ... "story01_mission01"          ; the prologue = the tutorial
 ```
 
-`chapter` **is** produced offline — `0x1001edd54` sets it on every mission
-completion, from the finished mission's own `"chapter"` data entry. It simply
-had nowhere to live between two launches.
+Persisting it was necessary and not sufficient. A device run stored
+`(250454, 0)`: the chapter really was written and read back — it was just 0,
+because **nothing offline ever produces a chapter**. `0x1001edd54` does not
+compute one; it reads it out of the mission-result map, whose only wholesale
+writer is `0x1001f129c`, the JSON callback of the *mission finished* HTTP
+request. Offline that request never completes, the map stays empty, and
+`map["chapter"]` default-inserts 0. The story cursor was server-computed.
+
+So it has to be produced locally, which is a second edit — one instruction:
+
+```
+0x1001edd28   ldr w20, [sp, #0x10]  ->  mov w20, #1
+```
+
+`w20` is read nowhere between that load and the store, so a completed mission
+now sets the chapter to 1 instead of 0. Nothing else offline writes the field,
+so it stays 1 — monotone, and never above what the game would unlock first.
+Deliberately conservative: incrementing per mission would reach 8 in eight
+missions, side missions included, because the mission→chapter mapping lived in
+the server's answer.
 
 `ud_QuestManager.sav` persists two ints (`v=3`, confirmed on a real device
 file). The second one, `progressMgr+0x2dc`, is the pending-mission id: the
@@ -164,13 +181,19 @@ objects that Gameloft kept server-side.
 | **v4** — three gates `nop`ed | 9 files instead of 6, and the main menu appeared for the first time. But 8 objects stayed silent, and progress did not come back. |
 | **v5** — six gates `nop`ed | Made it *worse*: `ud_Tutorial.sav` went from `0x0002073e` (nine steps) to `0x0000003e` (five). Arming an object without making it local means it gets written from a state that was never restored. |
 | **v6** — one instruction, in `ReloadAll` | The flag itself is set, so the twelve server objects take the exact path the five settings objects already take. **Verified on device: the save objects are written and restored correctly.** A fourth snapshot then showed `ud_Tutorial.sav` coming back intact at `0x0002073e` — and the prologue still replaying, which ruled the tutorial bitmask out as the trigger. |
-| **v7** — chapter in `ud_QuestManager` | On by default. `chapter` was the trigger, and it is produced offline; it just had no slot. It takes over the pending-mission id, which was always the constructor's own `-1`. |
+| **v7** — chapter in `ud_QuestManager` | Half of it. The chapter now has a slot, and device data proves it round-trips — but it round-tripped a 0. |
+| **v8** — produce the chapter locally | `mov w20, #1` at `0x1001edd28`. The chapter was never computed offline at all; the map it came from is filled only by the *mission finished* HTTP response. One instruction supplies the value the server used to. |
 
-An earlier version of this table recorded v7 as *disproved by measurement*.
-That was wrong: the build tested was run #19, whose job log shows only the
-main and local-save patches — the chapter flag was opt-in and was never
-passed. The `0` read back from that file was the pending-mission id, not a
-chapter.
+Two corrections this table has had to make, both from device data rather than
+from reading:
+
+- v7 was once recorded as *disproved by measurement*. It had never been
+  tested — the build installed was run #19, whose job log shows only the main
+  and local-save patches, so the `0` read back was the pending-mission id.
+- The claim that the chapter is produced locally at mission completion was
+  also wrong, and this time the measurement disproved it properly:
+  `(250454, 0)` after a completed prologue. The map that `0x1001edd54` reads
+  is network-fed, and `map["chapter"]` on an empty map inserts 0.
 
 ### `ud_Spider2.sav` is dead code
 
@@ -264,18 +287,24 @@ accepts files up to 2 GB and does not count against that quota.
 
 ### How to check the chapter patch on device
 
-1. Delete `Documents/ud_QuestManager.sav` (**required once** — see above).
-   Leave everything else alone.
+1. Delete `Documents/ud_QuestManager.sav` (**required once** — see above), or
+   start from an empty `Documents`. Leave everything else alone.
 2. Install the build, play the prologue **to the end**, force-quit.
 3. Relaunch.
 
 | What you see | What it means |
 |---|---|
 | the prologue does **not** replay | done |
-| the prologue replays, and `ud_QuestManager.sav` reads `(n, 0)` | the chapter is being saved as 0 — the prologue's own data did not advance it, and the next place to look is `0x1001ed644` |
-| the prologue replays, and `ud_QuestManager.sav` reads `(n, k)` with `k > 0` | the save half works and the restore does not; look at the `ReloadAll` ordering |
+| the prologue replays, `ud_QuestManager.sav` reads `(n, 1)` | the value is stored and restored, so something other than the chapter gates the request — back to `0x1001fc844` |
+| the prologue replays, `ud_QuestManager.sav` reads `(n, 0)` | `0x1001ed308` never ran, so the mission was not registered as completed at all |
 
-`tools/decode_sav.py Documents/ud_QuestManager.sav` prints those two ints.
+`tools/decode_sav.py Documents/ud_QuestManager.sav` prints those two ints, and
+`tools/sav-reader.html` does the same on the device itself.
+
+A second signal, free with the same run: `ud_Tutorial.sav` must **stop
+regressing**. Its deserialiser (`0x1003cc5d0`) throws the saved bitmask away
+when the chapter is 0, which is why it fell from `132926` to `54` between two
+sessions on the v7 build. If the chapter now holds, that value stays put.
 
 ## No-patch alternative
 

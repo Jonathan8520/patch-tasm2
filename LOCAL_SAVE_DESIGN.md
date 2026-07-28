@@ -262,27 +262,76 @@ confirmed three independent ways:
 | `0x10021deb0` | `chapter == 0` → `UI_prologue_progress_2`, else `UI_chapter_progress` |
 | `0x100215afc` | the profile mirrors it as `_ca = "ch<N>"` |
 
-### It *is* produced locally
+### It is never produced offline
 
-The earlier claim in this file — that only profile appliers write `chapter` —
-was wrong, and it came from a sweep that only followed `adrp`+`ldr` pairs in
-one register. A full `__text` sweep of every `str w*, [x*, #0x2a4]` finds four
-writers, and one of them is pure gameplay:
+This file said twice that the chapter is produced locally at mission
+completion. Device data disproved it: a completed prologue on the v7 build
+stored `(250454, 0)`.
+
+The complete writer set, from a sweep that matches a store's **byte range**
+against the field rather than its immediate against the offset — the
+distinction matters, see [Tooling](#tooling):
 
 | Writer | What it is |
 |---|---|
-| **`0x1001edd54`** | **mission completion** — takes the finished mission's own `"chapter"` entry (`0x1001ed644`, `map::operator[]` on the mission-result map) and stores it |
+| `0x1001f68ec` | the constructor, an 8-byte `str d1,[x9]` with `x9 = progressMgr+0x2a4`, writing 0 |
+| `0x1001edd54` | mission completion — but see below |
 | `0x1001ff530` | the legacy `v0`/`v1` deserialise branch (nothing writes such a stream) |
 | `0x10021bf84` | the in-`Update` profile applier — behind `HasMember("_ca")` |
 | `0x10021d134` | `ApplyProfile` — behind `HasMember("_ca")` |
 
-Both profile appliers are guarded, and offline the document they are handed is
-built from `mgr[0xa28]`, an empty `std::map`, so neither ever fires. Finishing
-a mission, on the other hand, sets `chapter` from the game's own data files —
-**offline, correctly, with no server involved.**
+Both appliers are guarded, and offline the document they are handed is built
+from `mgr[0xa28]`, an empty `std::map`, so neither fires. The
+`chapter >= 8 ? 0 : chapter + 1` at `0x1001f25d8` is never stored back — it
+feeds the `BossComing` HUD banner.
 
-The value is therefore computed locally and lost locally: nothing writes it to
-disk, so every launch starts again from 0.
+That leaves `0x1001edd54`, and it does not compute a chapter either. It reads
+one out of the mission-result map at `missionObj+0x320`, and that map has
+exactly one wholesale writer: `0x1001f129c`, reached only from `0x1001f7dd8`,
+the JSON response callback registered for the *mission finished* HTTP request.
+Offline the request never completes, the map stays empty, and
+`map["chapter"]` default-inserts 0 (`str wzr,[x24,#0x38]` at `0x1001ed694`)
+which goes straight into the field. `+0x2d8` — the respawn node id — is
+written by the same event three instructions earlier, which is why the device
+file reads `(250454, 0)`: a real local id beside a fabricated 0.
+
+**The story cursor was server-computed.** Persisting it was necessary; it was
+never going to be sufficient.
+
+### One field, three symptoms
+
+`chapter == 0` does not only replay the prologue:
+
+| Symptom | Mechanism |
+|---|---|
+| the prologue relaunches every session | `0x1001fc844` requests `story01_mission01` |
+| the tutorial bitmask regresses | the tutorial deserialiser `0x1003cc5d0` calls `0x1001f9388` (`chapter != 0`) and does `str wzr,[x19,#4]` when it is 0 — it throws the saved value away |
+| chapter-gated content stays locked | every reader of `+0x2a4` |
+
+The `132926 → 54` regression on device was therefore a *consequence*, not a
+second bug: the file was restored correctly and then wiped by the game.
+
+### Producing it locally — one instruction
+
+```
+0x1001edd28   ldr w20, [sp, #0x10]   ->   mov w20, #1
+...           w20 untouched
+0x1001edd54   str w20, [progressMgr, #0x2a4]
+```
+
+`w20` is read nowhere between the two, and the eight bytes of the load plus
+its neighbouring `adrp` occur exactly once in `__text`. A completed mission
+now sets the chapter to 1; nothing else offline writes the field, so it stays
+1 — monotone and never regressing.
+
+Conservative on purpose. `min(chapter + 1, 8)` per completed mission would
+reach the last chapter in eight missions, side missions included, because
+which mission belongs to which chapter lived in the server's answer and in the
+data paks it indexed. Setting 1 cannot unlock content out of order. If the
+story turns out to be gated beyond chapter 1, that needs a code cave rather
+than an in-place edit — the dead `ud_Spider2.sav` writer is one, and
+`0x1001edd54` already holds the progress manager in `x0`, so a `bl` fits in
+the slot the `str` occupies.
 
 ### The fix: give it the slot that was already wasted
 

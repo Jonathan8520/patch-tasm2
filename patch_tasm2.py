@@ -270,7 +270,11 @@ def verify_chapter(data):
     tx_addr, tx_off, tx_size = sects["__text"]
     text = bytes(data[tx_off:tx_off + tx_size])
     problems = []
-    for label, sig, idx, word in CHAPTER_SITES:
+    sites = list(CHAPTER_SITES) + [
+        (CHAPTER_LOCAL_SITE[0], CHAPTER_LOCAL_SITE[1], 0,
+         struct.unpack("<I", CHAPTER_LOCAL_STORE)[0]),
+    ]
+    for label, sig, idx, word in sites:
         if sig in text:
             problems.append(f"{label}: original instruction still present")
         patched = bytearray(sig)
@@ -334,6 +338,60 @@ CHAPTER_SITES = [
 ]
 
 
+# --- producing the chapter locally ------------------------------------------
+#
+# Persisting the chapter was necessary and not sufficient: a device run with the
+# patch above completed the prologue and stored (250454, 0). The chapter really
+# was written and read back -- it was just 0, and 0 is what makes 0x1001fc844
+# request "story01_mission01" all over again.
+#
+# The reason is that nothing offline ever produces a chapter. An exhaustive
+# sweep of __text -- every store form whose byte range covers +0x2a4, not merely
+# those whose immediate equals it -- finds five writers: the constructor
+# (0x1001f68ec, an 8-byte `str d1` writing 0), the deserialiser, the two profile
+# appliers behind HasMember("_ca"), and 0x1001edd54. The `chapter >= 8 ? 0 :
+# chapter + 1` at 0x1001f25d8 is never stored back; it feeds the "BossComing"
+# HUD banner.
+#
+# And 0x1001edd54 does not compute the chapter either. It reads it out of the
+# mission-result map at missionObj+0x320, whose only wholesale writer is
+# 0x1001f129c -- the JSON callback of the "mission finished" HTTP request. That
+# request cannot complete offline, so the map stays empty and
+# `map["chapter"]` default-inserts 0 (`str wzr,[x24,#0x38]` at 0x1001ed694),
+# which is then stored straight into the chapter. The story cursor was
+# server-computed, exactly as the device file shows.
+#
+# One field, three symptoms: the prologue relaunching, chapter-gated content
+# staying locked, and -- through 0x1003cc5d0, whose tutorial deserialiser calls
+# 0x1001f9388 (`chapter != 0`) and does `str wzr,[x19,#4]` when it is 0 -- the
+# tutorial bitmask being wiped on every launch. That is why ud_Tutorial.sav
+# regressed from 132926 to 54 on device while every other object round-tripped.
+#
+# So the value has to be produced locally. The load that feeds the store is
+#
+#     0x1001edd28   ldr w20, [sp, #0x10]      ; the 0 the empty map handed back
+#     ...                                     ; w20 untouched through here
+#     0x1001edd54   str w20, [progressMgr, #0x2a4]
+#
+# and w20 is read nowhere else in between, so replacing that one load with
+# `mov w20, #1` makes a completed mission set the chapter to 1 instead of 0.
+# Nothing else offline writes the field, so it stays 1: monotone, never
+# regressing, and never above what the game itself would have unlocked first.
+#
+# Deliberately conservative. Incrementing per completed mission would run to 8
+# in eight missions, side missions included, because which mission belongs to
+# which chapter lives in the data paks that only the server response resolved.
+# Setting 1 cannot unlock content out of order; if the story turns out to be
+# gated beyond chapter 1, that is the next thing to measure, and it needs a
+# code cave rather than an in-place edit.
+
+CHAPTER_LOCAL_SITE = ("produce the chapter locally at mission completion "
+                      "(0x1001edd28)",
+                      bytes.fromhex("f41340b968740090"))
+# mov w20, #1  -- replaces `ldr w20, [sp, #0x10]`, the empty map's 0
+CHAPTER_LOCAL_STORE = struct.pack("<I", 0x52800034)
+
+
 def patch_chapter_persist(m):
     """
     Make ud_QuestManager carry progressMgr+0x2a4 (chapter) in place of +0x2dc
@@ -346,8 +404,13 @@ def patch_chapter_persist(m):
     tx_addr, tx_off, tx_size = sects["__text"]
     text = bytes(m[tx_off:tx_off + tx_size])
 
+    sites = list(CHAPTER_SITES) + [
+        (CHAPTER_LOCAL_SITE[0], CHAPTER_LOCAL_SITE[1], 0,
+         struct.unpack("<I", CHAPTER_LOCAL_STORE)[0]),
+    ]
+
     planned = []
-    for label, sig, idx, word in CHAPTER_SITES:
+    for label, sig, idx, word in sites:
         hits, i = [], 0
         while True:
             i = text.find(sig, i)
@@ -448,6 +511,7 @@ def main():
         if chapter and "--verify-local-save" not in flags:
             problems += verify_chapter(data)
             checked += [label for label, _s, _i, _w in CHAPTER_SITES]
+            checked.append(CHAPTER_LOCAL_SITE[0])
         for p in problems:
             print(f"FAIL: {p}")
         if problems:
