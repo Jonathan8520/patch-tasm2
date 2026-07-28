@@ -483,6 +483,53 @@ showed settings surviving, which means the load-all runs offline too.
 The patch does not introduce a new mechanism. It widens a proven one from 6
 objects to 17.
 
+## The local mission server — and the lock on its state
+
+`progressMgr+0x50` is not an HTTP client in this build. It is a local mission
+server at `0x100416000..0x100422000` that reads the bundled
+`ch0.json … ch8.json` and synthesises the answers Gameloft's server used to
+send:
+
+| Request | What it does, offline |
+|---|---|
+| `0x16` | reads `profile["_ca"] == "chN"`, indexes `chapters[N]` (`0x100417cb4`–`0x100417cf4`) and fills `progressMgr+0x110`, the `map<string,vector<int>>` keyed `"mm"`/`"sm"`/`"prm"`/`"rm"` that is the story cursor |
+| `0x15` | advances `profile["_ca"]` to `chapterDoc["nc"]` at `0x10041b308` |
+
+So the cursor never needed reconstructing. Its state is save object 16
+(`mgr+0x970`, SaveIndex 16, version 2, ctor `0x1002157bc`) — the profile
+document — and object 16 is the only one of the seventeen that the writer
+refuses to write:
+
+```
+0x100211620   ldr  w8, [x19, #0x1c]      ; SaveIndex
+0x100211624   cmp  w8, #0x10
+0x100211628   b.ne <normal write>
+0x100211634   ldr  w8, [saveMgr, #0xfc8]
+0x100211638   and  w8, w8, #0xff00ff
+0x10021163c   cbz  w8, <exit without writing>
+```
+
+`+0xfc8` is set at construction only if the file already exists
+(`0x100218e28` `fopen "rb"` → `0x100218e34` / `0x100218e40`); `+0xfca` is set
+only at `0x10021d878` and `0x10021da18`, both cloud paths. Clean install ⇒
+both zero ⇒ never written ⇒ never exists. A closed loop, and the reason object
+16's `Reset` default chapter `"ch0"` (`0x100215b10`) was what the game started
+from every launch.
+
+One `nop` at `0x10021163c` opens it. The read-back side already ran for object
+16 unconditionally, so no new code path is enabled.
+
+**Device result:** `ud_OObjects.sav` appeared (914 bytes, `v=2`), the player is
+dropped into the open world, and the menu shows `UI_chapter_progress`
+("chapitre 1") instead of `UI_prologue_progress_2`. That string switch is
+`0x10021deb0`, which selects the chapter variant only when the chapter is
+non-zero.
+
+`ud_OObjects.sav` is the one file `tools/decode_sav.py` cannot read: object
+16's constructor sets the device-key flag at `0x100215920`
+(`strb w21,[x19,#0x26]`), so its XXTEA key comes from a device secret rather
+than from the file's own trailer.
+
 ## What is not covered
 
 `chapter` now has a home. The other profile scalars still do not:

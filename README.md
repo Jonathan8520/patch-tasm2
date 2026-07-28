@@ -202,6 +202,18 @@ enables no new code path: the file simply starts existing. Disable with
 > not just the chapter: if it ever holds a bad value, deleting that one file
 > resets it.
 
+**Confirmed on device.** The predicted file appeared: `ud_OObjects.sav`,
+914 bytes, `v=2` — matching object 16's declared version — rewritten between
+two sessions. The game now drops the player into the open world and the main
+menu reads *"Tu as terminé 0 % du chapitre 1"*, the `UI_chapter_progress`
+string, which `0x10021deb0` only selects when the chapter is non-zero; before
+this patch it always rendered `UI_prologue_progress_2`.
+
+`ud_OObjects.sav` is the one save file `tools/decode_sav.py` cannot read, and
+that is by design rather than a bug: object 16's constructor sets the
+device-key flag at `0x100215920` (`strb w21,[x19,#0x26]`), so its XXTEA key is
+derived from a device secret instead of from the file's own trailer.
+
 ### Complementary patches
 
 Dead Gameloft hostnames are rewritten to `.invalid` (RFC 6761: never
