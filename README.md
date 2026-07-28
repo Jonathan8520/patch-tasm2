@@ -3,12 +3,14 @@
 Patches the iOS build of **The Amazing Spider-Man 2 (1.3.1)** so it can be
 launched and played after Gameloft shut down its servers.
 
-**Scope, stated up front:** the game launches and plays offline, its save
-objects are persisted locally instead of to Gameloft's dead profile server,
-and the story chapter — the field that made the prologue replay on every
-launch — is persisted with them. See [Local saving](#local-saving). Four
-device snapshots drove those patches to their current shape, and the save
-format is fully decoded, so every step was measured rather than inferred.
+**Scope, stated up front:** the game launches, plays and **saves** offline.
+Settings, trophies, exploration, skills, position and the story cursor all
+persist across relaunches, and the story advances chapter by chapter without a
+server — confirmed on device up to chapter 2. See
+[Local saving](#local-saving) and [Status](#status). Every step was measured on
+real device data rather than inferred; the save format is fully decoded
+(`tools/decode_sav.py`, and `tools/sav-reader.html` to read a save on the
+phone itself).
 
 ## The problem
 
@@ -358,36 +360,36 @@ accepts files up to 2 GB and does not count against that quota.
 
 ## Status
 
-- ✅ **Verified on device** (LiveContainer, iOS): the “Downloading profile”
-  hang is gone; the game launches and plays offline.
-- ✅ **Verified on device:** the local save patch. Four snapshots — see
-  [Device results](LOCAL_SAVE_DESIGN.md#device-results). The save objects are
-  written and read back correctly; `ud_Tutorial.sav` returned bit-identical at
-  `0x0002073e` across a relaunch.
-- 🔬 **Not yet confirmed:** the chapter patch. Every link in it is verified
-  statically against the disassembly and against a real `ud_QuestManager.sav`
-  (`v=3`, `(250454, -1)`), but it has not yet run on a device.
+**Story progression works offline.** Measured on device, three snapshots from
+one continuous playthrough:
 
-### How to check the chapter patch on device
+| | after the prologue | ~50 % of chapter 1 | chapter 2 |
+|---|---|---|---|
+| `ud_OObjects.sav` (the profile) | 914 B | 1042 B | **1074 B** |
+| `ud_Tutorial.sav` | 132926 | 153406 | **161790** |
+| `ud_MCSkill.sav` | `(0, 0, 200)` | `(0, 0, 200)` | `(0, 0, 110)` — points spent |
+| `ud_FogOfWar.sav` | — | 880 B | 880 B |
 
-1. Delete `Documents/ud_QuestManager.sav` (**required once** — see above), or
-   start from an empty `Documents`. Leave everything else alone.
-2. Install the build, play the prologue **to the end**, force-quit.
-3. Relaunch.
+The profile file grows as the story advances, and the player reached chapter 2
+after completing chapter 1 **across several force-quits**. Every earlier
+symptom is gone: the prologue does not replay, the tutorial bitmask holds, and
+the menu reads *"chapitre 2"*.
 
-| What you see | What it means |
-|---|---|
-| the prologue does **not** replay | done |
-| the prologue replays, `ud_QuestManager.sav` reads `(n, 1)` | the value is stored and restored, so something other than the chapter gates the request — back to `0x1001fc844` |
-| the prologue replays, `ud_QuestManager.sav` reads `(n, 0)` | **the executable under test is not this build.** The serialiser writes the constant 1 into that slot unconditionally; a 0 can only come from a binary that lacks the patch. Delete the app from LiveContainer and install the IPA fresh rather than over the top |
+- ✅ the “Downloading profile” hang (LiveContainer, iOS)
+- ✅ the local save patch — all 17 objects written and read back
+- ✅ the tutorial bitmask — holds across relaunches
+- ✅ the profile save patch — the mission cursor persists and the chapter
+  advances on its own
 
-`tools/decode_sav.py Documents/ud_QuestManager.sav` prints those two ints, and
-`tools/sav-reader.html` does the same on the device itself.
+### One redundancy, deliberately left alone
 
-A second signal, free with the same run: `ud_Tutorial.sav` must **stop
-regressing**. Its deserialiser (`0x1003cc5d0`) throws the saved bitmask away
-when the chapter is 0, which is why it fell from `132926` to `54` between two
-sessions on the v7 build. If the chapter now holds, that value stays put.
+`ud_QuestManager.sav`'s second int is pinned to the constant 1 by the chapter
+patch, so `progressMgr+0x2a4` is always restored as 1 — while the *real*
+chapter now lives in `profile["_ca"]` and reached `"ch2"`. The pin is
+therefore redundant, and reverting `0x1001ff4c8` to `ldr w1,[x20,#0x2a4]`
+would make the file carry the true value. It has not been changed: the build
+above is the one that was measured working through chapter 2, and there is no
+observed problem to fix.
 
 ## No-patch alternative
 
