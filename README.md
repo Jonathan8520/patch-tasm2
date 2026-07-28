@@ -134,33 +134,30 @@ the game's own serialiser on both ends. Disable with `--no-persist-chapter`.
 > build carrying this. A file written by an earlier build holds `-1` in that
 > slot, and it would now be read as the chapter.
 
-### Prologue override (two instructions)
+### Tutorial guards (two instructions)
 
-The third device run settled the write half: `ud_QuestManager.sav` came back
-`(250454, 1)`. The chapter is saved. The prologue still replayed and
-`ud_Tutorial.sav` still regressed, so the value is not reaching
-`progressMgr+0x2a4` on the way back in.
-
-Restore order is not the explanation. The manager's object array — the one
-`ReloadAll` walks in order — is filled at `0x100218d00` from stack spills;
-resolving those puts the quest object (which carries the chapter) at
-**position 8** and the tutorial object at **position 10**. The chapter is
-restored two objects *before* the tutorial reads it, so a working restore
-would have spared the bitmask. It did not.
-
-Why it does not land is still open. The behaviour is closed anyway, by taking
-the chapter out of both decisions that consult it:
+Two paths discarded the tutorial bitmask, and device data caught both:
 
 ```
-0x1001fc868   cbnz w8, +0xc   ->  b +0xc      never re-request the prologue
-0x1003cc5f4   cbz  w0, +0x14  ->  nop         never wipe the tutorial bitmask
+0x1003cc5f4   cbz w0, +0x14      ->  nop    the deserialiser stops throwing the
+                                            saved value away when the chapter is 0
+0x1003cc5b8   str wzr,[x0,#4]    ->  nop    CTutorialMgr::Reset becomes a no-op
 ```
 
-This is an override, not a restoration: a genuinely fresh install now starts
-in the open world instead of the prologue. That is the trade — a prologue that
-replays forever is the bug, and offline the game has no other way to know it
-has already been played. `--no-force-prologue-skip` restores the faithful
-behaviour.
+The second one is the important one. Its single caller is the tail of the
+script dispatcher at `0x1001205ec`, so the game's own scripts ask for the
+reset, and one of them runs whenever the opening sequence plays: the restore
+put the saved value back and the script dropped it to 0 seconds later. Measured
+before: `132926 → 54`. After: `132926 → 132926 → 153406 → 161790`.
+
+Disable with `--no-force-prologue-skip`.
+
+> An earlier build also had `0x1001fc868 cbnz → b`, to stop `story01_mission01`
+> ever being requested. **That edit has been removed.** It was a stopgap from
+> before the profile save patch, and it cost the game its opening cinematic. It
+> is no longer needed: on a fresh install the chapter is 0, the prologue runs
+> exactly once, and completing it writes 1 through `0x1001edd54`, which
+> `ud_QuestManager.sav` restores on every later launch.
 
 Full reasoning, the save-object layout and the decoded file format:
 [LOCAL_SAVE_DESIGN.md](LOCAL_SAVE_DESIGN.md).

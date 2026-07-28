@@ -16,10 +16,14 @@ Chapter patch: ud_QuestManager's second persisted int is the pending-mission
 id, which is always the constructor's own -1 and therefore worth nothing. It
 carries the story chapter instead. Disable with --no-persist-chapter.
 
-Prologue override: device data shows the chapter being saved as 1 and still
-not reaching progressMgr+0x2a4 on the way back, so both decisions that read it
-stop reading it -- the prologue is never re-requested and the tutorial bitmask
-is never wiped. Disable with --no-force-prologue-skip. See LOCAL_SAVE_DESIGN.md.
+Tutorial guards: the tutorial bitmask is never wiped, on either of the two
+paths that used to discard it. Disable with --no-force-prologue-skip.
+
+Profile save: save object 16 -- the local mission server's profile document,
+and the whole story cursor with it -- was the one object the writer refused to
+write, behind a gate that could never unlock itself. One nop opens it, and the
+story then advances offline on its own. Disable with --no-profile-save.
+See LOCAL_SAVE_DESIGN.md.
 
 Complementary patches: dead Gameloft hosts rewritten to .invalid, jailbreak
 detection paths and function neutralised. Every edit preserves string and
@@ -472,9 +476,16 @@ def patch_chapter_persist(m):
 # way to know it has already been played. Disable with --no-force-prologue-skip
 # to get the faithful behaviour back.
 
+# The "never re-request the prologue" edit that used to live here
+# (0x1001fc868 cbnz -> b) has been REMOVED. It was a stopgap from before the
+# profile save patch, and it cost the game its opening cinematic, which is the
+# first thing story01_mission01 plays. It is no longer needed: on a fresh
+# install the chapter is 0, the prologue runs exactly once, and completing it
+# writes 1 through 0x1001edd54, which ud_QuestManager.sav then restores on
+# every later launch. The two tutorial-bitmask guards below stay -- they are
+# what stops earned progress being thrown away.
+
 PROLOGUE_SITES = [
-    ("never re-request the prologue (0x1001fc868)",
-     bytes.fromhex("6800003568f64639"), 0, 0x14000003),          # b +0xc
     ("never wipe the tutorial bitmask on restore (0x1003cc5f4)",
      bytes.fromhex("66b3f897a0000034e00314aa"), 1, 0xD503201F),  # nop
     # CTutorialMgr::Reset is `str wzr,[x0,#4] ; ret` -- it zeroes the whole
@@ -760,7 +771,7 @@ def main():
             for label, off in pr_sites:
                 print(f"    patched   @ file offset {off:<10} {label}")
     else:
-        print("\n>>> prologue override skipped (--no-force-prologue-skip)")
+        print("\n>>> tutorial guards skipped (--no-force-prologue-skip)")
 
     if chapter:
         if ch_err:
