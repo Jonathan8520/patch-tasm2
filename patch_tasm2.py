@@ -14,8 +14,12 @@ the five settings objects already use. Disable with --no-local-save.
 
 Chapter patch: ud_QuestManager's second persisted int is the pending-mission
 id, which is always the constructor's own -1 and therefore worth nothing. It
-carries the story chapter instead, so the game stops relaunching the prologue
-on every start. Disable with --no-persist-chapter. See LOCAL_SAVE_DESIGN.md.
+carries the story chapter instead. Disable with --no-persist-chapter.
+
+Prologue override: device data shows the chapter being saved as 1 and still
+not reaching progressMgr+0x2a4 on the way back, so both decisions that read it
+stop reading it -- the prologue is never re-requested and the tutorial bitmask
+is never wiped. Disable with --no-force-prologue-skip. See LOCAL_SAVE_DESIGN.md.
 
 Complementary patches: dead Gameloft hosts rewritten to .invalid, jailbreak
 detection paths and function neutralised. Every edit preserves string and
@@ -437,7 +441,102 @@ def patch_chapter_persist(m):
     return done, None
 
 
-def patch(data, local_save=True, chapter=True):
+# --- overriding the prologue, when restoring the chapter is not enough --------
+#
+# Device data, third run: ud_QuestManager.sav holds (250454, 1). The chapter is
+# written correctly now. The prologue still replays and ud_Tutorial.sav still
+# regresses, which means the value is not reaching progressMgr+0x2a4 on the way
+# back in.
+#
+# The restore order is not the explanation. The manager's object array
+# (mgr+0xa40, walked in order by ReloadAll) is filled at 0x100218d00 from stack
+# spills, and resolving those gives position 8 = the quest object (mgr+0x568,
+# the one that carries the chapter) and position 10 = the tutorial object
+# (mgr+0x6c8). The chapter is restored two objects *before* the tutorial reads
+# it, so a working restore would have spared the bitmask. It did not.
+#
+# Why the restore does not land is still open. What can be closed is the
+# behaviour, by taking the chapter out of both decisions:
+#
+#     0x1001fc868   cbnz w8, +0xc   ->  b +0xc
+#         the launch check stops asking whether the chapter is 0, so
+#         "story01_mission01" is never requested again.
+#
+#     0x1003cc5f4   cbz w0, +0x14   ->  nop
+#         the tutorial deserialiser stops branching to its `str wzr,[x19,#4]`,
+#         so the saved bitmask is read back whatever the chapter says.
+#
+# This is an override, not a restoration: a genuinely fresh install will start
+# in the open world instead of the prologue. That is a deliberate trade -- the
+# prologue replaying forever is the bug being fixed, and the game has no other
+# way to know it has already been played. Disable with --no-force-prologue-skip
+# to get the faithful behaviour back.
+
+PROLOGUE_SITES = [
+    ("never re-request the prologue (0x1001fc868)",
+     bytes.fromhex("6800003568f64639"), 0, 0x14000003),          # b +0xc
+    ("never wipe the tutorial bitmask (0x1003cc5f4)",
+     bytes.fromhex("66b3f897a0000034e00314aa"), 1, 0xD503201F),  # nop
+]
+
+
+def _apply_sites(m, sites, what):
+    """Apply a list of (label, signature, word_index, replacement) sites."""
+    base, size = arm64_slice_off(m)
+    if base is None:
+        return [], "no arm64 slice"
+    sects = arm64_sections(m, base)
+    tx_addr, tx_off, tx_size = sects["__text"]
+    text = bytes(m[tx_off:tx_off + tx_size])
+
+    planned = []
+    for label, sig, idx, word in sites:
+        hits, i = [], 0
+        while True:
+            i = text.find(sig, i)
+            if i < 0:
+                break
+            hits.append(i)
+            i += 1
+        if len(hits) != 1:
+            return [], f"{label}: expected 1 match, found {len(hits)}"
+        planned.append((label, tx_off + hits[0] + idx * 4, word))
+
+    done = []
+    for label, off, word in planned:
+        m[off:off + 4] = struct.pack("<I", word)
+        done.append((label, off))
+    return done, None
+
+
+def _verify_sites(data, sites):
+    base, size = arm64_slice_off(data)
+    if base is None:
+        return ["no arm64 slice"]
+    sects = arm64_sections(data, base)
+    tx_addr, tx_off, tx_size = sects["__text"]
+    text = bytes(data[tx_off:tx_off + tx_size])
+    problems = []
+    for label, sig, idx, word in sites:
+        if sig in text:
+            problems.append(f"{label}: original instruction still present")
+        patched = bytearray(sig)
+        patched[idx * 4:idx * 4 + 4] = struct.pack("<I", word)
+        n = text.count(bytes(patched))
+        if n != 1:
+            problems.append(f"{label}: expected 1 patched site, found {n}")
+    return problems
+
+
+def patch_prologue(m):
+    return _apply_sites(m, PROLOGUE_SITES, "prologue override")
+
+
+def verify_prologue(data):
+    return _verify_sites(data, PROLOGUE_SITES)
+
+
+def patch(data, local_save=True, chapter=True, prologue=True):
     m = bytearray(data)
     patches = []
     pat = re.compile(rb"[\x20-\x7e]{6,130}")
@@ -495,8 +594,11 @@ def patch(data, local_save=True, chapter=True):
     # --- optional: carry the story chapter in the local save ---
     ch_sites, ch_err = patch_chapter_persist(m) if chapter else ([], None)
 
+    # --- optional: override the prologue decision outright ---
+    pr_sites, pr_err = patch_prologue(m) if prologue else ([], None)
+
     return (bytes(m), patches, jb, fn_ok, skip_ok, skip_off, ls_sites, ls_err,
-            ch_sites, ch_err)
+            ch_sites, ch_err, pr_sites, pr_err)
 
 
 def main():
@@ -505,6 +607,7 @@ def main():
 
     local_save = "--no-local-save" not in flags
     chapter = "--no-persist-chapter" not in flags
+    prologue = "--no-force-prologue-skip" not in flags
 
     if flags & {"--verify", "--verify-local-save"}:
         if len(args) != 1:
@@ -520,6 +623,9 @@ def main():
             problems += verify_chapter(data)
             checked += [label for label, _s, _i, _w in CHAPTER_SITES]
             checked.append(CHAPTER_LOCAL_SITE[0])
+        if prologue and "--verify-local-save" not in flags:
+            problems += verify_prologue(data)
+            checked += [label for label, _s, _i, _w in PROLOGUE_SITES]
         for p in problems:
             print(f"FAIL: {p}")
         if problems:
@@ -531,7 +637,7 @@ def main():
 
     if len(args) != 2:
         print("usage: patch_tasm2.py [--no-local-save] [--no-persist-chapter] "
-              "<input_binary> <output_binary>")
+              "[--no-force-prologue-skip] <input_binary> <output_binary>")
         print("       patch_tasm2.py --verify <patched_binary>")
         return 1
 
@@ -552,8 +658,20 @@ def main():
         name = {2: "MH_EXECUTE", 6: "MH_DYLIB"}.get(ft, str(ft))
         print(f"  {label:6} off={off:<10} size={size:<10} filetype={name}")
 
-    out, patches, jb, fn_ok, skip_ok, skip_off, ls_sites, ls_err, ch_sites, ch_err = \
-        patch(data, local_save=local_save, chapter=chapter)
+    out, patches, jb, fn_ok, skip_ok, skip_off, ls_sites, ls_err, ch_sites, \
+        ch_err, pr_sites, pr_err = \
+        patch(data, local_save=local_save, chapter=chapter, prologue=prologue)
+
+    if prologue:
+        if pr_err:
+            print(f"\n>>> ERROR: prologue override NOT applied: {pr_err}")
+        else:
+            print("\n>>> PROLOGUE override patched: the prologue is never "
+                  "re-requested, the tutorial bitmask is never wiped")
+            for label, off in pr_sites:
+                print(f"    patched   @ file offset {off:<10} {label}")
+    else:
+        print("\n>>> prologue override skipped (--no-force-prologue-skip)")
 
     if chapter:
         if ch_err:
@@ -614,6 +732,10 @@ def main():
 
     if chapter and ch_err:
         print("ERROR: chapter persistence incomplete, aborting")
+        return 1
+
+    if prologue and pr_err:
+        print("ERROR: prologue override incomplete, aborting")
         return 1
 
     if local_save and ls_err:

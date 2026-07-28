@@ -132,6 +132,34 @@ the game's own serialiser on both ends. Disable with `--no-persist-chapter`.
 > build carrying this. A file written by an earlier build holds `-1` in that
 > slot, and it would now be read as the chapter.
 
+### Prologue override (two instructions)
+
+The third device run settled the write half: `ud_QuestManager.sav` came back
+`(250454, 1)`. The chapter is saved. The prologue still replayed and
+`ud_Tutorial.sav` still regressed, so the value is not reaching
+`progressMgr+0x2a4` on the way back in.
+
+Restore order is not the explanation. The manager's object array — the one
+`ReloadAll` walks in order — is filled at `0x100218d00` from stack spills;
+resolving those puts the quest object (which carries the chapter) at
+**position 8** and the tutorial object at **position 10**. The chapter is
+restored two objects *before* the tutorial reads it, so a working restore
+would have spared the bitmask. It did not.
+
+Why it does not land is still open. The behaviour is closed anyway, by taking
+the chapter out of both decisions that consult it:
+
+```
+0x1001fc868   cbnz w8, +0xc   ->  b +0xc      never re-request the prologue
+0x1003cc5f4   cbz  w0, +0x14  ->  nop         never wipe the tutorial bitmask
+```
+
+This is an override, not a restoration: a genuinely fresh install now starts
+in the open world instead of the prologue. That is the trade — a prologue that
+replays forever is the bug, and offline the game has no other way to know it
+has already been played. `--no-force-prologue-skip` restores the faithful
+behaviour.
+
 Full reasoning, the save-object layout and the decoded file format:
 [LOCAL_SAVE_DESIGN.md](LOCAL_SAVE_DESIGN.md).
 
@@ -183,6 +211,8 @@ objects that Gameloft kept server-side.
 | **v6** — one instruction, in `ReloadAll` | The flag itself is set, so the twelve server objects take the exact path the five settings objects already take. **Verified on device: the save objects are written and restored correctly.** A fourth snapshot then showed `ud_Tutorial.sav` coming back intact at `0x0002073e` — and the prologue still replaying, which ruled the tutorial bitmask out as the trigger. |
 | **v7** — chapter in `ud_QuestManager` | Half of it. The chapter now has a slot, and device data proves it round-trips — but it round-tripped a 0. |
 | **v8** — produce the chapter locally | `mov w20, #1` at `0x1001edd28`. The chapter was never computed offline at all; the map it came from is filled only by the *mission finished* HTTP response. One instruction supplies the value the server used to. |
+| **v9** — write the chapter as a constant | Measured `(250454, 1)`: the save half is proven. |
+| **v10** — override the prologue decision | The chapter is saved and still does not come back. Both readers of it — the launch check and the tutorial deserialiser — stop consulting it. |
 
 Two corrections this table has had to make, both from device data rather than
 from reading:
