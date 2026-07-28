@@ -1,223 +1,174 @@
 # TASM2 offline patch — The Amazing Spider-Man 2 (iOS 1.3.1)
 
-Patches the iOS build of **The Amazing Spider-Man 2 (1.3.1)** so it can be
-launched and played after Gameloft shut down its servers.
+Gameloft's servers for *The Amazing Spider-Man 2* have been dead since ~2018,
+and the iOS build hangs forever on **“Downloading profile”**. This patches the
+game so it launches, plays **and saves** entirely offline.
 
-**Scope, stated up front:** the game launches, plays and **saves** offline.
-Settings, trophies, exploration, skills, position and the story cursor all
-persist across relaunches, and the story advances chapter by chapter without a
-server — confirmed on device up to chapter 2. See
-[Local saving](#local-saving) and [Status](#status). Every step was measured on
-real device data rather than inferred; the save format is fully decoded
-(`tools/decode_sav.py`, and `tools/sav-reader.html` to read a save on the
-phone itself).
+Eight instructions, all in the arm64 slice, every one derived from the
+disassembly and verified on the binary that actually ships. No new save
+format, no injected code, no size change.
 
-## The problem
+**Confirmed on device** (LiveContainer, iOS): a continuous playthrough through
+the prologue, all of chapter 1 and into chapter 2, with the app force-quit
+several times along the way. Settings, trophies, exploration, skills, position,
+tutorial state and the story cursor all survive.
 
-On launch the game hangs forever on **“Downloading profile”**
-(`UI_DOWNLOADING_PROFILE`). It waits for a Gameloft profile server that no
-longer exists, and the wait never ends.
+## Get it
 
-Internal error strings in the binary:
+1. **Actions** tab → *Patch TASM2 IPA* → **Run workflow**
+2. Download `SpiderMan2_patched.ipa` from the **v1.0** release
+3. Install with LiveContainer / SideStore / Sideloadly
 
-- `[COnlineManager] anubi server init profile failed`
-- `[CFedServerManager::GetProfile] Failed to get profile info from Seshat`
+> **Patch before installing, not after.** LiveContainer loads apps with
+> `dlopen()` and converts the binary from `MH_EXECUTE` to `MH_DYLIB` **at
+> install time**. Replacing the binary inside an already-installed `.app`
+> overwrites that conversion and produces `cannot dlopen a main executable`.
+> When updating, delete the app first rather than installing over the top.
 
-## The fix
+## What works
 
-### Main patch (from arm64 disassembly)
+| | |
+|---|---|
+| Launch | no more “Downloading profile” spinner |
+| Story | prologue plays once, then the chapters advance on their own |
+| Saves | all 17 save objects persist to `Documents/ud_*.sav` |
+| Profile | the story cursor persists in `ud_OObjects.sav` |
+| Settings, trophies, fog of war, skills, position, tutorial state | all persist |
 
-`UI_DOWNLOADING_PROFILE` has **exactly one emission site** in the whole
-binary. In the update loop a shared predicate decides between showing that
-spinner and emitting the game's own `UI_FIRST_CHECK` state (“no profile to
-download, carry on”):
+## What still does not
+
+- **Anything genuinely online**: shop purchases, events, friends. The servers
+  are gone; the game says so with a *“Le réseau actuel est indisponible”*
+  dialog, which is honest.
+- **A waiting spinner** can stay on screen (home, skills, shop). Each pending
+  request sets a bit in a mask at `progressMgr+0x330`
+  (`0x1001e7b94` sets, `0x1001e7f3c` clears, the widget hides when the mask
+  reaches 0). Offline some requests never answer, so their bit is never
+  cleared. There are 65 show sites and 66 hide sites, so there is no single
+  point to fix; the only blunt option is to make `0x1001e7b94` return
+  immediately, which also removes the input-blocking mask it puts up during
+  real loads. Left alone deliberately.
+
+## How it works
+
+### 1. Get past the login — `0x1000ab7b8`
+
+`UI_DOWNLOADING_PROFILE` has exactly one emission site. A shared predicate
+decides between that spinner and the game's own `UI_FIRST_CHECK` (“nothing to
+download, carry on”), and it keeps answering “yes” because the login never
+completes.
 
 ```
-bl   sub_100346c10         ; predicate: "download profile?"
-cbz  w0, UI_FIRST_CHECK    ; == 0 -> carry on
-...  UI_DOWNLOADING_PROFILE ; != 0 -> infinite spinner (server is dead)
+bl <predicate>   ->   mov w0, #0
 ```
 
-The predicate keeps answering “yes” because the online login never completes.
-The patch replaces that `bl` with `mov w0, #0`, so the `cbz` is always taken
-and the game follows its native offline path.
+Applied only at that call site; the predicate itself is called from ~50 other
+places and is left alone. Self-locating through the single reference to the
+string.
 
-Four bytes, length preserved, applied **only at that call site** — the shared
-predicate itself is called from ~50 other places and is left alone. The patch
-self-locates through the single reference to the string, so it does not rely
-on hardcoded offsets.
+### 2. Make every save object local — `0x10021bc7c`
 
-### Local save patch (one instruction)
+Each save object has a byte at `+0x25`: *“persist me to a local
+`ud_<Name>.sav`”*. The constructor sets it on **five** of the seventeen — the
+settings. Everything else rode in the Gameloft profile.
 
-Every save object carries a byte at `+0x25`: *"persist me to a local
-`ud_<Name>.sav` file"*. The manager's constructor sets `+0x24 = 1`
-("server-persisted") on all seventeen and `+0x25 = 1` on only **five** of them
-— the settings. Everything else, story progress included, travelled inside the
-Gameloft profile blob, which is why it evaporates offline.
-
-Those five work perfectly, and device data proves it: `ud_Sound`'s state
-carried across a relaunch unchanged. So the fix is not to bypass the seven
-branches that read the flag — an earlier build `nop`ed six of them and made
-things *worse*, producing objects that were armed but still not local, which
-let a good `ud_Tutorial.sav` be overwritten with a regressed one.
-
-The fix is to set the flag. `CSaveMgr::ReloadAll` already walks all seventeen
-objects at session start, already holds `1` in `w25`, and already has the
-object in `x20`. Its first act on each object is the branch that skips the
-non-local ones:
+`CSaveMgr::ReloadAll` already walks all seventeen, already holds `1` in `w25`,
+and its first act on each is the branch that skips the non-local ones:
 
 ```
 0x10021bc78   ldrb w8, [x20, #0x25]
 0x10021bc7c   cbz  w8, <next object>   ->   strb w25, [x20, #0x25]
 ```
 
-Four bytes. From there every object is genuinely local, so all seven original
-gates pass on their own — including one in `SaveObj::Save` that no `nop` could
-have fixed safely. Twelve objects become byte-for-byte equivalent in treatment
-to the five that already work, with **the game's own serialisers on both
-ends** — no new save format, no injected code.
+From there the other twelve take exactly the path the five already take, with
+the game's own serialisers on both ends.
 
-The site is located by an 8-byte signature that occurs exactly once in
-`__text`; the patcher writes nothing if it is missing or ambiguous, and
-`--verify` re-checks the binary that actually ships. Pass `--no-local-save` to
-build without it.
+### 3–4. Carry the chapter in `ud_QuestManager` — `0x1001ff4c8`, `0x1001ff594`
 
-### Chapter patch (two instructions)
-
-Restoring the save objects is not enough on its own: the game still relaunched
-the prologue every time. The trigger is one 32-bit field, and it is not in any
-save object.
+That object persists two ints. The second, `progressMgr+0x2dc`, is the
+pending-mission id: the constructor sets it to `-1`, its only producer resets
+its source to `-1` right after use, and its only consumer reads `-1` as
+“nothing pending”. Every save stored the constructor default, so the slot was
+free.
 
 ```
-0x1001fc864   ldr  w8, [progressMgr, #0x2a4]   ; chapter
-0x1001fc868   cbnz w8, <normal flow>
-0x1001fc988   ... "story01_mission01"          ; the prologue = the tutorial
+0x1001ff4c8   ldr w1, [x20, #0x2dc]  ->  mov w1, #1              serialise
+0x1001ff594   str w0, [x19, #0x2dc]  ->  str w0, [x19, #0x2a4]   restore
 ```
 
-Persisting it was necessary and not sufficient. A device run stored
-`(250454, 0)`: the chapter really was written and read back — it was just 0,
-because **nothing offline ever produces a chapter**. `0x1001edd54` does not
-compute one; it reads it out of the mission-result map, whose only wholesale
-writer is `0x1001f129c`, the JSON callback of the *mission finished* HTTP
-request. Offline that request never completes, the map stays empty, and
-`map["chapter"]` default-inserts 0. The story cursor was server-computed.
+Still two ints at version 3 — format, length and version byte unchanged.
 
-So it has to be produced locally, which is a second edit — one instruction:
+### 5. Produce the chapter locally — `0x1001edd28`
+
+`0x1001edd54` does not compute a chapter; it reads one out of the
+mission-result map, whose only wholesale writer is the JSON callback of the
+*mission finished* HTTP request. Offline the map stays empty and
+`map["chapter"]` default-inserts 0.
 
 ```
 0x1001edd28   ldr w20, [sp, #0x10]  ->  mov w20, #1
 ```
 
-`w20` is read nowhere between that load and the store, so a completed mission
-now sets the chapter to 1 instead of 0. Nothing else offline writes the field,
-so it stays 1 — monotone, and never above what the game would unlock first.
-Deliberately conservative: incrementing per mission would reach 8 in eight
-missions, side missions included, because the mission→chapter mapping lived in
-the server's answer.
+`w20` is read nowhere between that load and the store.
 
-`ud_QuestManager.sav` persists two ints (`v=3`, confirmed on a real device
-file). The second one, `progressMgr+0x2dc`, is the pending-mission id: the
-constructor initialises it to `-1`, its only producer resets its source to
-`-1` straight after use, and its only consumer reads `-1` as "nothing
-pending". Every save stored the constructor default. So the slot now carries
-the chapter instead, on both sides:
+### 6–7. Stop the tutorial bitmask being discarded — `0x1003cc5f4`, `0x1003cc5b8`
+
+Two paths threw it away, and device data caught both:
 
 ```
-0x1001ff4c8   ldr w1, [x20, #0x2dc]  ->  ldr w1, [x20, #0x2a4]     serialise
-0x1001ff594   str w0, [x19, #0x2dc]  ->  str w0, [x19, #0x2a4]     restore
+0x1003cc5f4   cbz w0, +0x14      ->  nop   the deserialiser stops discarding
+                                           the saved value when the chapter is 0
+0x1003cc5b8   str wzr, [x0, #4]  ->  nop   CTutorialMgr::Reset becomes a no-op
 ```
 
-Still two ints at version 3 — file format, length and version unchanged, with
-the game's own serialiser on both ends. Disable with `--no-persist-chapter`.
+The second matters most: its single caller is the tail of the script
+dispatcher at `0x1001205ec`, so the game's own scripts request the reset, and
+one runs whenever the opening sequence plays. Before: `132926 → 54`. After:
+`132926 → 153406 → 161790`.
 
-> **Delete `Documents/ud_QuestManager.sav` once** before the first launch of a
-> build carrying this. A file written by an earlier build holds `-1` in that
-> slot, and it would now be read as the chapter.
+### 8. Let the profile reach disk — `0x10021163c`
 
-### Tutorial guards (two instructions)
+**The one that made story progression work.**
 
-Two paths discarded the tutorial bitmask, and device data caught both:
+`progressMgr+0x50` is not an HTTP client in this build. It is a **local
+mission server** (`0x100416000..0x100422000`) that reads the bundled
+`ch0.json … ch8.json` and synthesises the answers Gameloft's server used to
+send: request `0x16` fills the whole story cursor (`progressMgr+0x110`, a
+`map<string,vector<int>>` keyed `"mm"`/`"sm"`/`"prm"`/`"rm"`) from
+`profile["_ca"] == "chN"`; request `0x15` advances `profile["_ca"]` to
+`chapterDoc["nc"]`.
 
-```
-0x1003cc5f4   cbz w0, +0x14      ->  nop    the deserialiser stops throwing the
-                                            saved value away when the chapter is 0
-0x1003cc5b8   str wzr,[x0,#4]    ->  nop    CTutorialMgr::Reset becomes a no-op
-```
-
-The second one is the important one. Its single caller is the tail of the
-script dispatcher at `0x1001205ec`, so the game's own scripts ask for the
-reset, and one of them runs whenever the opening sequence plays: the restore
-put the saved value back and the script dropped it to 0 seconds later. Measured
-before: `132926 → 54`. After: `132926 → 132926 → 153406 → 161790`.
-
-Disable with `--no-force-prologue-skip`.
-
-> An earlier build also had `0x1001fc868 cbnz → b`, to stop `story01_mission01`
-> ever being requested. **That edit has been removed.** It was a stopgap from
-> before the profile save patch, and it cost the game its opening cinematic. It
-> is no longer needed: on a fresh install the chapter is 0, the prologue runs
-> exactly once, and completing it writes 1 through `0x1001edd54`, which
-> `ud_QuestManager.sav` restores on every later launch.
-
-Full reasoning, the save-object layout and the decoded file format:
-[LOCAL_SAVE_DESIGN.md](LOCAL_SAVE_DESIGN.md).
-
-### Profile save patch (one instruction)
-
-The mission cursor never needed reconstructing. `progressMgr+0x50` is not an
-HTTP client in this build — it is a **local mission server**
-(`0x100416000..0x100422000`) that reads the bundled `ch0.json … ch8.json` and
-synthesises the answers the Gameloft server used to send. Request `0x16` fills
-the whole RAM cursor (`progressMgr+0x110`, a
-`std::map<std::string,std::vector<int>>` keyed `"mm"`/`"sm"`/`"prm"`/`"rm"`) by
-reading `profile["_ca"] == "chN"` and indexing `chapters[N]`; request `0x15`
-advances `profile["_ca"]` to `chapterDoc["nc"]` at `0x10041b308`.
-
-That profile is save object 16 — and it is the only object in the binary the
-writer refuses to write:
+Its state is save object 16 — the profile document — and object 16 is the only
+one of the seventeen the writer refuses to write:
 
 ```
 0x100211620   ldr  w8, [x19, #0x1c]      ; SaveIndex
-0x100211624   cmp  w8, #0x10             ; == 16 ?
+0x100211624   cmp  w8, #0x10
 0x100211628   b.ne <normal write>
 0x100211634   ldr  w8, [saveMgr, #0xfc8]
 0x100211638   and  w8, w8, #0xff00ff
 0x10021163c   cbz  w8, <exit without writing>   ->   nop
 ```
 
-`+0xfc8` is *"did this file already exist when the manager was constructed"*
-(`0x100218e28` `fopen "rb"`), `+0xfca` is *"the cloud profile was touched"*, set
-only on two dead-offline paths. Clean install ⇒ both 0 ⇒ never written ⇒ never
-exists. A closed loop, and the reason object 16's `Reset` default of `"ch0"`
-(`0x100215b10`) is what the game starts from every single launch.
+`+0xfc8` is *“did this file already exist when the manager was constructed”*;
+`+0xfca` is *“the cloud profile was touched”*, set only on two dead-offline
+paths. Clean install ⇒ both zero ⇒ never written ⇒ never exists. A loop that
+locks itself, and the reason object 16's `Reset` default of `"ch0"` was what
+the game started from every launch.
 
-The read-back side already runs for object 16 unconditionally, so the `nop`
-enables no new code path: the file simply starts existing. Disable with
-`--no-profile-save`.
+The read-back side already ran for object 16 unconditionally, so the `nop`
+enables no new code path — the file simply starts existing.
 
-> Two consequences worth knowing. A `ud_*.sav` you have never seen appears in
-> `Documents` — its name comes from a runtime config lookup, so it cannot be
-> derived from the binary. And the whole short-key profile now carries over,
-> not just the chapter: if it ever holds a bad value, deleting that one file
-> resets it.
+> `ud_OObjects.sav` is the one save file `tools/decode_sav.py` cannot read,
+> and that is by design: object 16's constructor sets the device-key flag at
+> `0x100215920`, so its XXTEA key comes from a device secret rather than from
+> the file's own trailer.
 
-**Confirmed on device.** The predicted file appeared: `ud_OObjects.sav`,
-914 bytes, `v=2` — matching object 16's declared version — rewritten between
-two sessions. The game now drops the player into the open world and the main
-menu reads *"Tu as terminé 0 % du chapitre 1"*, the `UI_chapter_progress`
-string, which `0x10021deb0` only selects when the chapter is non-zero; before
-this patch it always rendered `UI_prologue_progress_2`.
-
-`ud_OObjects.sav` is the one save file `tools/decode_sav.py` cannot read, and
-that is by design rather than a bug: object 16's constructor sets the
-device-key flag at `0x100215920` (`strb w21,[x19,#0x26]`), so its XXTEA key is
-derived from a device secret instead of from the file's own trailer.
-
-### Complementary patches
+### Complementary edits
 
 Dead Gameloft hostnames are rewritten to `.invalid` (RFC 6761: never
 resolves), and the jailbreak detection paths and function are neutralised.
-Every edit preserves length exactly, so no Mach-O offset shifts.
+Every edit preserves length exactly.
 
 | Neutralised host | Role |
 |---|---|
@@ -227,169 +178,74 @@ Every edit preserves length exactly, so no Mach-O offset shifts.
 | ingameads.gameloft.com | ads / iphoneloading.php |
 | 201205igp.gameloft.com | IGP / freemium |
 
-## Usage
+### Opting out
 
-1. **Actions** tab → *Patch TASM2 IPA* → **Run workflow**
-2. The patched IPA is published as a **GitHub Release** under the chosen tag
-   (`patched-latest` by default). Download `SpiderMan2_patched.ipa`.
-3. Install with LiveContainer / SideStore / Sideloadly.
+`--no-local-save`, `--no-persist-chapter`, `--no-force-prologue-skip`,
+`--no-profile-save`. The patcher writes nothing if a site is missing or
+ambiguous, and `patch_tasm2.py --verify <binary>` re-checks all eight on the
+binary that ships — the build workflow runs it after rezipping.
 
-### Patch before installing, not after
+## Tools
 
-LiveContainer loads apps with `dlopen()` and converts the binary from
-`MH_EXECUTE` to `MH_DYLIB` **at install time**. Replacing the binary inside an
-already-installed `.app` overwrites that conversion and produces:
+`tools/` is the analysis harness. It expects the executable at
+`/home/user/AmazingSpiderMan2`, overridable with `TASM2_BIN`.
 
-```
-cannot dlopen a main executable
-```
-
-## Local saving
-
-Three earlier attempts failed, and the conclusion drawn from them — that the
-code to save progress locally did not exist — was wrong. It does exist: it is
-the system that keeps your settings. It was simply gated off for the eleven
-objects that Gameloft kept server-side.
-
-| Attempt | Result |
+| | |
 |---|---|
-| **v1** — remove the writer's "dirty" gate | Regression: stuck at 45 % on load. The writer flushes `ud_*.sav` **untimed** (only `ud_Spider2.sav` has a 20 s timer), so without the gate it ran every frame → I/O storm. |
-| **v2** — set the dirty flag on the event-driven flush | Files appeared for the objects that were already local-capable, but progression still did not come back. |
-| **v3** — patch `ldrb [x22,#0x25]` | That is `0x10021a1b4`, the save-all **loop filter** — one gate out of seven. Letting the loop reach `Save` changes nothing while `Save` still routes the blob to the upload queue. No file appeared, and the flag looked innocent. |
-| **v4** — three gates `nop`ed | 9 files instead of 6, and the main menu appeared for the first time. But 8 objects stayed silent, and progress did not come back. |
-| **v5** — six gates `nop`ed | Made it *worse*: `ud_Tutorial.sav` went from `0x0002073e` (nine steps) to `0x0000003e` (five). Arming an object without making it local means it gets written from a state that was never restored. |
-| **v6** — one instruction, in `ReloadAll` | The flag itself is set, so the twelve server objects take the exact path the five settings objects already take. **Verified on device: the save objects are written and restored correctly.** A fourth snapshot then showed `ud_Tutorial.sav` coming back intact at `0x0002073e` — and the prologue still replaying, which ruled the tutorial bitmask out as the trigger. |
-| **v7** — chapter in `ud_QuestManager` | Half of it. The chapter now has a slot, and device data proves it round-trips — but it round-tripped a 0. |
-| **v8** — produce the chapter locally | `mov w20, #1` at `0x1001edd28`. The chapter was never computed offline at all; the map it came from is filled only by the *mission finished* HTTP response. One instruction supplies the value the server used to. |
-| **v9** — write the chapter as a constant | Measured `(250454, 1)`: the save half is proven. |
-| **v10** — override the prologue decision | The chapter is saved and still does not come back. Both readers of it — the launch check and the tutorial deserialiser — stop consulting it. |
-| **v11** — neuter `CTutorialMgr::Reset` | Measured: `ud_Tutorial.sav` holds at 132926 across a relaunch instead of falling to 62. The tutorial bitmask persists — and the story mission still restarted, which is what pointed at the real cause. |
-| **v12** — let the profile object reach disk | The mission cursor was never missing: the game contains a **local mission server** that computes it from the bundled `chN.json`. Its state is save object 16, the one object the writer is forbidden to write. One `nop` opens the loop. |
+| `machoscan.py` | FAT/Mach-O parsing, `LC_FUNCTION_STARTS` for exact function bounds, libc stub names from the indirect symbol table, ADRP/ADD cross-references |
+| `scan.py` | `dis` / `fn` / `str` / `sref` / `xref` / `callers` / `info` |
+| `summary.py` | dense per-function overview |
+| `decode_sav.py` | decodes a `ud_*.sav` all the way to plain bytes |
+| `encode_sav.py` | the inverse; refuses to write what it cannot read back |
+| `sav-reader.html` | the same decoder as a self-contained page, to read a save on the phone |
+| `st.py`, `sweep2.py`, `sweep2d8.py` | field sweeps that match a store's **byte range**, not its immediate — see below |
+| `thisclose.py`, `closure2.py`, `closure3.py` | symbolic tracking of a base register through a function |
 
-Two corrections this table has had to make, both from device data rather than
-from reading:
-
-- v7 was once recorded as *disproved by measurement*. It had never been
-  tested — the build installed was run #19, whose job log shows only the main
-  and local-save patches, so the `0` read back was the pending-mission id.
-- The claim that the chapter is produced locally at mission completion was
-  also wrong, and this time the measurement disproved it properly:
-  `(250454, 0)` after a completed prologue. The map that `0x1001edd54` reads
-  is network-fed, and `map["chapter"]` on an empty map inserts 0.
-
-### `ud_Spider2.sav` is dead code
-
-Its writer does:
-
-```
-sprintf(buf, "%s/ud_Spider2.sav", docs)   ; buf receives the PATH
-fopen(...) ; rand()                        ; random key, never stored
-XOR(buf, key ^ index) ; fwrite(buf, 0x7bf) ; that same buf is written out
-```
-
-Confirmed against a real 1983-byte file pulled off the device: with the
-recovered key (`0xff`), the decrypted content starts with
-`/var/mobile/Containers/Data/Application/<UUID>/Documents/…` — the file's own
-path — followed by 47 % zeros and leftover stack data. **No game data at
-all.** And `%s/ud_Spider2.sav` is referenced exactly once in the entire
-binary: by that writer. No reader exists.
-
-### What persists, before and after
-
-The local save system (`ud_<Name>.sav`, writer `0x1002115f0` / reader
-`0x1002119ac`) covered only the objects with the local flag set — settings,
-essentially. The other eleven rode in the server profile, which is what the
-game means by *“Connect online just once to retrieve your last save.”*
-
-The profile deserialiser `ApplyProfile` (`0x10021cef8`) makes that explicit:
-it walks the same 17 objects, keyed `ud_<Name>`, and writes each blob into the
-**same field** (`+0x60`) the local reader fills. Server profile and local file
-were two sources feeding one sink. The patch simply keeps the sink fed from
-the local one.
-
-`chapter` was the one field that had no sink at all; the chapter patch gives
-it one. Still without a local home: `finish_ch8` (`+0x2a8`, endgame only) and
-the profile's other scalars, which the local save objects `ud_Economy`,
-`ud_Item` and `ud_MCSkill` are expected to cover. See
-[LOCAL_SAVE_DESIGN.md](LOCAL_SAVE_DESIGN.md#what-is-not-covered).
-
-## Replacing the server (branch `serveur-gameloft`)
-
-Giving the game a server is the architecturally correct answer, and it was
-tested on device. Result: **the HTTP path is a dead end.**
-
-Redirecting works end to end — the phone really did reach a Cloudflare Worker
-we controlled. But the only HTTP traffic is the ad WebView
-(`sec-fetch-dest: document`, `accept: text/html`, identical payload across
-launches). **`autologin.php` is never called**, even with the profile patch
-removed so the game attempts a genuine login.
-
-The profile — and therefore saving — goes exclusively through the
-**federation server: raw TCP, opcode-based binary protocol** (`_socket`,
-`_connect`, `_send`, `_recv` stubs; `port=7744&type=gs`;
-`Send federation request, opcode[%d]`).
-
-Two consequences, recorded on that branch:
-
-1. String-length limits are **not** the real obstacle — a DNS rewrite
-   (NextDNS, AdGuard, an iOS DNS profile) can point any hostname at an IP of
-   your choice without touching the binary.
-2. The real obstacle is the **protocol**: framing, handshake, opcodes and
-   possible encryption would have to be reconstructed with **no reference
-   capture available**, the servers having been dead since ~2018.
-
-Continuing would require **dynamic analysis on the device** (Frida or LLDB,
-breakpoints on `send`/`recv` around `CFedServerManager`).
+Matching `str Wt,[Xn,#imm]` against an offset is **not** an enumeration of a
+field's writers: it misses every wider store at a lower offset. That is not
+hypothetical — it is how the progress manager's constructor
+(`str d1,[x9]`, `x9 = progressMgr+0x2a4`) escaped the first sweep in this
+repo, and it cost a device test.
 
 ## Binary facts
 
-- FAT `armv7 + arm64`
+- FAT `armv7 + arm64`; all edits are in the arm64 slice
 - `cryptid=0` on both slices → already decrypted, no Apple ID prompt
 - SDK iphoneos10.3 / Xcode 8.3, MinimumOSVersion 8.0
-- Original SHA1: `b3d322a788bbeeb1a006ba0da23a28300a5b7105`
-- Size: 33,375,152 bytes (unchanged after patching)
+- Original SHA1 `b3d322a788bbeeb1a006ba0da23a28300a5b7105`, 33,375,152 bytes,
+  unchanged after patching
 
-## Why a Release and not an artifact
+The IPA is ~769 MB, which is why the workflow publishes it as a **Release**
+(2 GB limit) rather than an artifact (bounded by the 500 MB account quota).
 
-The IPA is ~769 MB. Actions artifacts are bounded by the account storage quota
-(500 MB on personal accounts), which makes the upload fail. A GitHub Release
-accepts files up to 2 GB and does not count against that quota.
+## Why the servers were not simply replaced
 
-## Status
+Giving the game a server was tried on device and is a dead end. Redirecting
+works end to end — the phone really did reach a Cloudflare Worker under our
+control — but the only HTTP traffic is the ad WebView. `autologin.php` is
+never called, even with the profile patch removed so the game attempts a
+genuine login.
 
-**Story progression works offline.** Measured on device, three snapshots from
-one continuous playthrough:
+The profile went exclusively through the **federation server: raw TCP, an
+opcode-based binary protocol** (`_socket`/`_connect`/`_send`/`_recv`,
+`port=7744&type=gs`, `Send federation request, opcode[%d]`). Framing,
+handshake, opcodes and any encryption would have to be reconstructed with no
+reference capture, the servers having been dead since ~2018. Hostname length
+is *not* the obstacle — a DNS rewrite points any name anywhere without
+touching the binary.
 
-| | after the prologue | ~50 % of chapter 1 | chapter 2 |
-|---|---|---|---|
-| `ud_OObjects.sav` (the profile) | 914 B | 1042 B | **1074 B** |
-| `ud_Tutorial.sav` | 132926 | 153406 | **161790** |
-| `ud_MCSkill.sav` | `(0, 0, 200)` | `(0, 0, 200)` | `(0, 0, 110)` — points spent |
-| `ud_FogOfWar.sav` | — | 880 B | 880 B |
-
-The profile file grows as the story advances, and the player reached chapter 2
-after completing chapter 1 **across several force-quits**. Every earlier
-symptom is gone: the prologue does not replay, the tutorial bitmask holds, and
-the menu reads *"chapitre 2"*.
-
-- ✅ the “Downloading profile” hang (LiveContainer, iOS)
-- ✅ the local save patch — all 17 objects written and read back
-- ✅ the tutorial bitmask — holds across relaunches
-- ✅ the profile save patch — the mission cursor persists and the chapter
-  advances on its own
-
-### One redundancy, deliberately left alone
-
-`ud_QuestManager.sav`'s second int is pinned to the constant 1 by the chapter
-patch, so `progressMgr+0x2a4` is always restored as 1 — while the *real*
-chapter now lives in `profile["_ca"]` and reached `"ch2"`. The pin is
-therefore redundant, and reverting `0x1001ff4c8` to `ldr w1,[x20,#0x2a4]`
-would make the file carry the true value. It has not been changed: the build
-above is the one that was measured working through chapter 2, and there is no
-observed problem to fix.
+Which is the irony of this project: the local replacement Gameloft shipped in
+the same binary was there the whole time, behind one `cbz`.
 
 ## No-patch alternative
 
-Blocking those domains via DNS (NextDNS, AdGuard, manual DNS) **before the
+Blocking those domains via DNS (NextDNS, AdGuard, an iOS profile) **before the
 first launch** produces the same network failure as the host rewrite, without
 touching any file and fully reversibly. It does not solve saving.
+
+## Further reading
+
+[LOCAL_SAVE_DESIGN.md](LOCAL_SAVE_DESIGN.md) — the save subsystem, the decoded
+file format, the full reasoning behind each edit, and the log of everything
+that was tried and did not work, including the two conclusions that device
+data had to overturn.

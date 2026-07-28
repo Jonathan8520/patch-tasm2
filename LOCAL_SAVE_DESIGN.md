@@ -1,13 +1,49 @@
-# Local save — how it works, and why it is one instruction
+# Local save — the reasoning, and everything that was tried
 
-Status: **implemented** in `patch_tasm2.py` (`patch_local_save`), and
-partially confirmed on device — see [Device results](#device-results). This
-file is the reasoning behind that instruction, and the map of the save
-subsystem for anyone who needs to go further.
+Status: **done and confirmed on device.** This file is the map of the save
+subsystem and the record of how the eight shipped edits were arrived at,
+including the false trails, because they are the expensive part.
 
-All addresses are virtual addresses in the arm64 slice, which is linked at
+All addresses are virtual addresses in the arm64 slice, linked at
 `0x100000000`. The tooling that produced them is in `tools/` (see the bottom
 of this file).
+
+## The twelve attempts
+
+Each row was a real build installed on a real device. The measurements are
+what moved the design; the reasoning between them was wrong twice.
+
+| Attempt | Result |
+|---|---|
+| **v1** — remove the writer's "dirty" gate | Regression: stuck at 45 % on load. The writer flushes `ud_*.sav` untimed, so without the gate it ran every frame → I/O storm. |
+| **v2** — set the dirty flag on the event-driven flush | Files appeared for the objects that were already local-capable, but progression still did not come back. |
+| **v3** — patch `ldrb [x22,#0x25]` | That is `0x10021a1b4`, the save-all loop filter — one gate out of seven. Letting the loop reach `Save` changes nothing while `Save` still routes the blob to the upload queue. |
+| **v4** — three gates `nop`ed | 9 files instead of 6, and the main menu appeared for the first time. Eight objects stayed silent. |
+| **v5** — six gates `nop`ed | Made it *worse*: `ud_Tutorial.sav` went from `0x0002073e` (nine steps) to `0x0000003e` (five). Arming an object without making it local means it gets written from a state that was never restored. |
+| **v6** — one instruction, in `ReloadAll` | Set the flag instead of bypassing its readers. **Verified: the save objects are written and restored correctly.** A later snapshot showed `ud_Tutorial.sav` returning intact and the prologue still replaying, which ruled the tutorial bitmask out as the trigger. |
+| **v7** — chapter in `ud_QuestManager` | The chapter gets a slot and round-trips — but it round-tripped a 0. |
+| **v8** — produce the chapter locally | `mov w20,#1` at `0x1001edd28`. The chapter was never computed offline at all: the map it comes from is filled only by the *mission finished* HTTP response. |
+| **v9** — write the chapter as a constant | Measured `(250454, 1)`. The save half is proven; the value still did not come back into RAM. |
+| **v10** — override the prologue decision | Removed the `story01_mission01` request outright. It only skipped the opening cinematic — the tutorial still ran, which proved the tutorial is not that level. **Later reverted**, see below. |
+| **v11** — neuter `CTutorialMgr::Reset` | `ud_Tutorial.sav` holds at 132926 across a relaunch instead of falling to 62. The bitmask persists — and the story mission still restarted, which is what finally pointed at the real cause. |
+| **v12** — let the profile object reach disk | The mission cursor was never missing. The game contains a local mission server that computes it from the bundled `chN.json`; its state is save object 16, the one object the writer is forbidden to write. One `nop` opens the loop. **This is the fix.** |
+
+v10 was reverted once v12 landed: it was a stopgap, it cost the game its
+opening cinematic, and with the chapter persisting it is unnecessary.
+
+### The two conclusions device data had to overturn
+
+- **"`--persist-chapter` is disproved."** It had never been tested. The build
+  installed was run #19, whose job log lists only the main and local-save
+  patches, so the `0` read back was the pending-mission id, not a chapter.
+  Never trust a measurement without checking which binary produced it.
+- **"The chapter is produced locally at mission completion."** Also wrong, and
+  this time the measurement disproved it properly: `(250454, 0)` after a
+  completed prologue. The map `0x1001edd54` reads is network-fed, and
+  `map["chapter"]` on an empty map inserts 0.
+
+Both errors came from sweeps that were not sound. See
+[Tooling](#tooling).
 
 ## The mistake that cost three attempts
 
@@ -87,8 +123,10 @@ device. `tools/decode_sav.py` implements the whole chain.
    key[3] = (ts & 0x000000ff) ^ origLen
    ```
 
-   No device secret is mixed in unless the object sets its `+0x26` flag, and
-   none of the seventeen does.
+   No device secret is mixed in unless the object sets its `+0x26` flag.
+   Exactly one of the seventeen does: object 16, the profile document, whose
+   constructor sets it at `0x100215920`. That is why `ud_OObjects.sav` is the
+   one file `decode_sav.py` cannot read — by design, not by bug.
 
 4. **zlib**: bytes `[0, compLen-4)` inflate to `origLen`, and the four bytes at
    `compLen-4` are a `crc32` of the result. It verifies on every file.
