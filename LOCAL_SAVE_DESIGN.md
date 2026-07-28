@@ -454,6 +454,26 @@ have been worse than shipping nothing.
   giving string and call cross-references.
 - `scan.py` — `dis` / `fn` / `str` / `sref` / `xref` / `callers` / `info`.
 - `summary.py` — dense per-function overview: strings, calls, struct offsets.
+- `decode_sav.py` / `encode_sav.py` — the save format, both directions.
+- `sav-reader.html` — the same decoder as a self-contained page, so a save can
+  be read on the device instead of shipping a container snapshot back.
+
+Field sweeps get their own layer, because the naive one is not sound. Matching
+`str Wt,[Xn,#imm]` misses a field that is written by a wider store at a lower
+offset — that is how the progress manager's constructor
+(`str d1,[x9]`, `x9 = progressMgr+0x2a4`) escaped the first pass:
+
+- `st.py` — decodes every AArch64 load/store form: scaled immediate, unscaled
+  `STUR`, pre/post-index with writeback, register offset, `STP` pairs, SIMD
+  structures, exclusives and atomics, reporting the base register, the byte
+  offset and the **width**. A field sweep asks "does this store's byte range
+  cover my field", not "is its immediate equal to my offset".
+- `sweep2.py`, `sweep2d8.py` — linear sweeps over `__text` for a byte range,
+  with per-function reset so register state never leaks across a boundary.
+- `thisclose.py`, `closure2.py`, `closure3.py` — symbolic tracking of a base
+  register (`this`, or a global loaded from a fixed address) through a
+  function, including writeback forms, so a store can be attributed to an
+  object rather than to a register number.
 
 They expect the executable at `/home/user/AmazingSpiderMan2`, overridable with
 `TASM2_BIN`. The `Publish binary for analysis` workflow extracts it from the
