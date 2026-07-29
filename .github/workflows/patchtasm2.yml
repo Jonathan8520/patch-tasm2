@@ -87,7 +87,14 @@ jobs:
           set -euo pipefail
           mkdir -p verif
           unzip -qo SpiderMan2_patched.ipa -d verif
-          BIN="verif/Payload/$(ls verif/Payload | head -1)/AmazingSpiderMan2"
+          # A glob, not `ls | head -1`: under `pipefail` a SIGPIPE from ls
+          # when head closes the pipe early would fail the step for no reason.
+          APP=(verif/Payload/*.app)
+          if [ ${#APP[@]} -ne 1 ]; then
+            echo "FAIL: expected exactly one .app in Payload, found ${#APP[@]}"
+            exit 1
+          fi
+          BIN="${APP[0]}/AmazingSpiderMan2"
 
           SIZE=$(stat -c%s "$BIN")
           echo "size: $SIZE (expected 33375152)"
