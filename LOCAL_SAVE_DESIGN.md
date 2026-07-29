@@ -58,7 +58,8 @@ apply to the objects that hold progression: those are flagged
 "server-persisted", and their blobs travelled in the Gameloft profile.
 
 So nothing had to be written. The code was all there; it was gated off for
-eleven of the seventeen save objects.
+twelve of the seventeen save objects — the constructor sets the local flag on
+exactly five.
 
 ## The save subsystem
 
@@ -214,9 +215,10 @@ which selects `+0x30` over `+0x48` as the document to build into and which no
 `nop` could have fixed safely. Twelve objects become byte-for-byte equivalent
 in treatment to the five that already work.
 
-The eight bytes of `ldrb` + `cbz` are unique in `__text`, so the patch
-self-locates, and `--verify` re-checks the binary that actually ships (both
-this patch and the chapter one).
+The eight bytes of `ldrb` + `cbz` are unique in `__text` and match on a
+four-byte boundary, so the patch self-locates. `--verify` re-checks the binary
+that actually ships — every edit, not just this one, plus the absence of the
+prologue-skip edit that was removed.
 
 ### Why the flag is set here and not in the constructor
 
@@ -387,6 +389,11 @@ reading the field:
 0x1001ff4c8   ldr w1, [x20, #0x2a4]   ->   mov w1, #1
 ```
 
+That "before" is the *v9* build, not the shipped one. The patcher never emits
+`ldr w1,[x20,#0x2a4]`: it matches the original `ldr w1,[x20,#0x2dc]` and writes
+`mov w1,#1` in one step, so the intermediate state above exists only in this
+account of how the decision was reached.
+
 Offline the chapter is only ever 0 or 1, so a constant 1 *is* `max(chapter, 1)`
 — and unlike a read it cannot lose a race with the flush. The saved file then
 reports chapter 1 from its first write onward, whatever the ordering, which
@@ -432,9 +439,14 @@ at exactly the value it was being restored to. Two 4-byte edits hand the slot
 to the chapter, on both sides:
 
 ```
-0x1001ff4c8   ldr w1, [x20, #0x2dc]  ->  ldr w1, [x20, #0x2a4]
+0x1001ff4c8   ldr w1, [x20, #0x2dc]  ->  mov w1, #1
 0x1001ff594   str w0, [x19, #0x2dc]  ->  str w0, [x19, #0x2a4]
 ```
+
+The serialise side reads as a constant rather than as `ldr w1,[x20,#0x2a4]`
+because it went straight from one to the other — see
+[the serialiser writes the constant](#and-the-serialiser-writes-the-constant-not-the-field)
+above for why. Only the restore side reads the chapter field.
 
 Still two ints, still version 3: the file format, its length and its version
 byte are all unchanged, and the game's own serialiser sits on both ends.
@@ -612,7 +624,7 @@ doc                           rapidjson::Value*, so parseable from a text file
 
 An injected dylib (LiveContainer loads tweaks) could build that document from
 a JSON file and call it. That route is *not* implemented here, because the
-three NOPs cover the save objects and shipping untested injected code would
+shipped edits cover the save objects and shipping untested injected code would
 have been worse than shipping nothing.
 
 ## Tooling

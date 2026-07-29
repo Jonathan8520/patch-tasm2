@@ -15,8 +15,12 @@ tutorial state and the story cursor all survive.
 
 ## Get it
 
-1. **Actions** tab → *Patch TASM2 IPA* → **Run workflow**
-2. Download `SpiderMan2_patched.ipa` from the **v1.0** release
+The workflow builds the IPA from the archive.org copy, and running a workflow
+needs write access to the repository it runs in — so **fork this one first**.
+The Actions tab of somebody else's repository will not run it for you.
+
+1. **Fork**, then **Actions** tab → *Patch TASM2 IPA* → **Run workflow**
+2. Download `SpiderMan2_patched.ipa` from the release the run creates
 3. Install with LiveContainer / SideStore / Sideloadly
 
 > **Patch before installing, not after.** LiveContainer loads apps with
@@ -71,7 +75,10 @@ bl <predicate>   ->   mov w0, #0
 
 Applied only at that call site; the predicate itself is called from ~50 other
 places and is left alone. Self-locating through the single reference to the
-string.
+string: every ADRP/ADD pair forming that address is collected, each ADD has to
+sit within eight instructions of its ADRP, and exactly one candidate must
+survive — a first-match rule would patch a wrong `bl` in silence if a stale
+register value ever produced one.
 
 ### 2. Make every save object local — `0x10021bc7c`
 
@@ -187,15 +194,36 @@ Every edit preserves length exactly.
 
 ### Opting out
 
-`--no-local-save`, `--no-persist-chapter`, `--no-force-prologue-skip`,
-`--no-profile-save`. The patcher writes nothing if a site is missing or
-ambiguous, and `patch_tasm2.py --verify <binary>` re-checks all eight on the
-binary that ships — the build workflow runs it after rezipping.
+`--no-local-save`, `--no-persist-chapter`, `--no-tutorial-guards`,
+`--no-profile-save`. An unknown flag is an error rather than a silent no-op, so
+a typo cannot quietly drop an edit; `--no-force-prologue-skip` still works as
+the former name of `--no-tutorial-guards`.
+
+The patcher writes nothing if a site is missing or ambiguous, and
+`patch_tasm2.py --verify <binary>` re-checks the binary that ships: all eight
+edits — the main patch included — plus the jailbreak edit, plus that no live
+Gameloft host survived, plus that the removed prologue-skip edit is **absent**,
+so a binary built by an older patcher cannot pass. The build workflow runs it
+after rezipping, and that is the only gate on the release.
 
 ## Tools
 
-`tools/` is the analysis harness. It expects the executable at
-`/home/user/AmazingSpiderMan2`, overridable with `TASM2_BIN`.
+`tools/` is the analysis harness. The three scripts that open the executable
+themselves — `scan.py`, `summary.py`, `st.py` — read its path from `TASM2_BIN`,
+defaulting to `/home/user/AmazingSpiderMan2`; the sweeps and closures import it
+from `st.py`, so the variable covers them too. `machoscan.py` is a library and
+takes the path as an argument, and `decode_sav.py` / `encode_sav.py` work on
+`.sav` files named on the command line, not on the executable. Imports resolve
+relative to each script's own location, so the directory works wherever it is
+cloned:
+
+```
+pip install -r tools/requirements.txt      # capstone, for the disassembler
+TASM2_BIN=/path/to/AmazingSpiderMan2 python3 tools/scan.py dis 0x10021bc3c 40
+```
+
+`patch_tasm2.py` itself depends on nothing outside the standard library, which
+is why the build workflow installs nothing.
 
 | | |
 |---|---|
