@@ -100,7 +100,7 @@ jobs:
             **The Amazing Spider-Man 2 (1.3.1)** — patched to launch, play and
             **save** entirely offline, after Gameloft shut down its servers.
 
-            Nine instructions in the arm64 slice, all derived from the
+            Eight instructions in the arm64 slice, all derived from the
             disassembly and re-verified on the binary in this IPA. No size
             change, no injected code.
 

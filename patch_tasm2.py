@@ -607,32 +607,40 @@ def verify_profile_save(data):
     return _verify_sites(data, PROFILE_SAVE_SITES)
 
 
-# --- the waiting spinner ------------------------------------------------------
+# --- the waiting spinner: TRIED, HARMFUL, OFF BY DEFAULT ---------------------
 #
-# A spinner can sit on screen forever -- on the home menu, the skills page, and
-# worst of all in the shop after a purchase fails. It is driven by a mask of
-# reasons at progressMgr+0x330: 0x1001e7b94 sets bit N and shows the widget,
-# 0x1001e7f3c clears bit N and hides it once the mask reaches 0. Offline some
-# requests never answer, so their bit is never cleared and the widget never
-# goes away. 65 show sites, 66 hide sites -- there is no single request to fix.
+# The spinner can sit on screen forever offline -- home menu, skills page, and
+# worst in the shop after a failed purchase. It is driven by a mask of reasons
+# at progressMgr+0x330: 0x1001e7b94 sets bit N and shows the widget,
+# 0x1001e7f3c clears bit N and hides it once the mask reaches 0. Some requests
+# never answer offline, so their bit is never cleared.
 #
-# So stop showing it. The function is void: its epilogue returns whatever a
-# destructor left in w0, and several callers reach it by `b` rather than `bl`,
-# which only compiles for a void tail call. Turning its first instruction into
-# `ret` therefore satisfies every caller, including the tail-callers, for whom
-# it becomes an immediate return.
+# Turning 0x1001e7b94 into `ret` removes the spinner -- and breaks the menus.
+# Device report: the skills page no longer loads its content at all.
 #
-# What this costs: the widget also puts up an input-blocking mask, so taps are
-# no longer swallowed while one of these requests is pending. That is a real
-# trade, and it is acceptable here because this widget is the *network* wait --
-# level loading has its own full-screen loading screen, which is untouched.
-# Offline, every wait this thing reports is a request that can never succeed.
+# The reasoning that shipped it was wrong in a specific, instructive way. It
+# checked the *calling convention* -- the function returns nothing meaningful
+# and several callers reach it by `b`, so no caller is left holding a bogus
+# value -- and concluded "safe to skip". That is a proof about the return
+# value, not about the body. The body opens with
 #
-# The prologue is a common one (9 identical copies in __text), so the signature
-# runs seven words deep, to the distinctive `mov w20, #0x17fffff`.
+#     0x1001e7bc4   bl 0x1001e78b0
+#
+# a 185-instruction routine that touches the managers at 0x1010740c0,
+# 0x101074100 and 0x101074210. Whatever that does, the menus need it. "Void" is
+# not the same as "no side effects", and the spinner was carrying real
+# information: those pages genuinely are still loading.
+#
+# Kept here because the analysis is sound and the site is right, should anyone
+# want to work on the widget rather than delete it -- the promising direction
+# is the mask, not the spinner: 0x1001e7d80 (`ldr w8,[x19,#0x32c]; cbz w8`)
+# guards the "Waiting.Mask" input blocker separately from the spinner itself,
+# so the feedback could stay while taps pass through. Not attempted.
+#
+# --kill-spinner enables it. Do not, unless you are re-testing this.
 
 SPINNER_SITES = [
-    ("never show the network waiting spinner (0x1001e7b94)",
+    ("never show the network waiting spinner (0x1001e7b94) -- BREAKS MENUS",
      bytes.fromhex("ffc304d1f65710a9f44f11a9fd7b12a9fd830491f30300aa14d0bf12"),
      0, 0xD65F03C0),   # ret
 ]
@@ -655,7 +663,7 @@ def verify_prologue(data):
 
 
 def patch(data, local_save=True, chapter=True, prologue=True,
-          profile_save=True, spinner=True):
+          profile_save=True, spinner=False):
     m = bytearray(data)
     patches = []
     pat = re.compile(rb"[\x20-\x7e]{6,130}")
@@ -735,7 +743,7 @@ def main():
     chapter = "--no-persist-chapter" not in flags
     prologue = "--no-force-prologue-skip" not in flags
     profile_save = "--no-profile-save" not in flags
-    spinner = "--keep-spinner" not in flags
+    spinner = "--kill-spinner" in flags
 
     if flags & {"--verify", "--verify-local-save"}:
         if len(args) != 1:
@@ -771,7 +779,7 @@ def main():
 
     if len(args) != 2:
         print("usage: patch_tasm2.py [--no-local-save] [--no-persist-chapter] "
-              "[--no-force-prologue-skip] [--no-profile-save] [--keep-spinner] "
+              "[--no-force-prologue-skip] [--no-profile-save] [--kill-spinner] "
               "<input_binary> <output_binary>")
         print("       patch_tasm2.py --verify <patched_binary>")
         return 1
@@ -802,11 +810,12 @@ def main():
         if sp_err:
             print(f"\n>>> ERROR: spinner patch NOT applied: {sp_err}")
         else:
-            print("\n>>> SPINNER patched: the network waiting spinner is never shown")
+            print("\n>>> SPINNER patched: never shown -- WARNING, this breaks "
+                  "the skills menu; see the comment in this file")
             for label, off in sp_sites:
                 print(f"    patched   @ file offset {off:<10} {label}")
     else:
-        print("\n>>> spinner left in place (--keep-spinner)")
+        print("\n>>> spinner left in place (it is load feedback, not noise)")
 
     if profile_save:
         if ps_err:
