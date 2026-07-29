@@ -532,7 +532,7 @@ CHAPTER_SITES = [
 # staying locked, and -- through 0x1003cc5d0, whose tutorial deserialiser calls
 # 0x1001f9388 (`chapter != 0`) and does `str wzr,[x19,#4]` when it is 0 -- the
 # tutorial bitmask being wiped on every launch. That is why ud_Tutorial.sav
-# regressed from 132926 to 54 on device while every other object round-tripped.
+# regressed from 132926 to 62 on device while every other object round-tripped.
 #
 # So the value has to be produced locally. The load that feeds the store is
 #
@@ -608,7 +608,11 @@ def patch_chapter_persist(m):
 #         Neutralise the store and the method becomes a no-op, so nothing can
 #         discard tutorial progress once it is earned.
 #
-# Measured on device: 132926 -> 54 before, 132926 -> 153406 -> 161790 after.
+# Measured on device: 132926 -> 62 before, 132926 -> 153406 -> 161790 after.
+# The two "before" values in this block are two different runs -- 132926
+# (0x2073e, nine steps) and 137022 (0x2173e, ten) -- and both fall to the same
+# 62 (0x3e, five), because after a wipe the tutorial re-earns the same first
+# five steps whatever had been banked.
 #
 # These guards do NOT skip the prologue, and nothing here does. A third edit
 # that did (0x1001fc868 cbnz -> b) shipped for a while and has been REMOVED: it

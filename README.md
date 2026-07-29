@@ -137,7 +137,8 @@ Two paths threw it away, and device data caught both:
 
 The second matters most: its single caller is the tail of the script
 dispatcher at `0x1001205ec`, so the game's own scripts request the reset, and
-one runs whenever the opening sequence plays. Before: `132926 → 54`. After:
+one runs whenever the opening sequence plays. Before: `132926 → 62`
+(`0x0002073e → 0x0000003e`, nine tutorial steps down to five). After:
 `132926 → 153406 → 161790`.
 
 ### 8. Let the profile reach disk — `0x10021163c`

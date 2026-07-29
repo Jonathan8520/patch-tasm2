@@ -348,7 +348,7 @@ never going to be sufficient.
 | the tutorial bitmask regresses | the tutorial deserialiser `0x1003cc5d0` calls `0x1001f9388` (`chapter != 0`) and does `str wzr,[x19,#4]` when it is 0 — it throws the saved value away |
 | chapter-gated content stays locked | every reader of `+0x2a4` |
 
-The `132926 → 54` regression on device was therefore a *consequence*, not a
+The `132926 → 62` regression on device was therefore a *consequence*, not a
 second bug: the file was restored correctly and then wiped by the game.
 
 ### Producing it locally — one instruction
