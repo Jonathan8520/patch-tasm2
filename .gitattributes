@@ -1,0 +1,13 @@
+# Normalise line endings in the repository regardless of which git, which
+# platform and which core.autocrlf a contributor happens to have. Without
+# this, a Windows checkout whose git does not set autocrlf reports every
+# tracked file as modified, and a commit from that git rewrites the whole
+# repository to CRLF in one whitespace-only diff.
+* text=auto eol=lf
+
+# Binary, never touch.
+*.png binary
+*.jpg binary
+*.gz  binary
+*.ipa binary
+*.sav binary
