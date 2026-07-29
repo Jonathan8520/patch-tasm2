@@ -17,7 +17,7 @@ id, which is always the constructor's own -1 and therefore worth nothing. It
 carries the story chapter instead. Disable with --no-persist-chapter.
 
 Tutorial guards: the tutorial bitmask is never wiped, on either of the two
-paths that used to discard it. Disable with --no-force-prologue-skip.
+paths that used to discard it. Disable with --no-tutorial-guards.
 
 Profile save: save object 16 -- the local mission server's profile document,
 and the whole story cursor with it -- was the one object the writer refused to
@@ -54,6 +54,50 @@ JB_PATHS = [
     b"/ftc/bpt",
     b"/var/lib/apt",
 ]
+
+# The jailbreak detector is the one edit that cannot self-locate: its prologue
+# (`sub sp,sp,#0xc0 ; stp x20,x19,[sp,#0xa0]`) is a generic one that recurs all
+# over __text, so there is no unique signature to anchor to. The file offset
+# below is therefore exact-or-nothing -- the eight bytes are compared before
+# anything is written, and the offset is now checked to fall inside the arm64
+# __text section first, which the raw offset never was.
+#
+# Unlike the other eight edits this one is complementary rather than
+# load-bearing: without it the game still launches, plays and saves, so a
+# mismatch warns instead of aborting.
+JB_FUNC_FILEOFF = 19016508
+JB_FUNC_ORIG = bytes.fromhex("ff0303d1f44f0aa9")
+JB_FUNC_PATCH = struct.pack("<II", 0x52800000, 0xD65F03C0)  # mov w0,#0 ; ret
+JB_FUNC_LABEL = "neutralise the jailbreak detection function (arm64)"
+
+KNOWN_FLAGS = {
+    "--no-local-save",
+    "--no-persist-chapter",
+    "--no-tutorial-guards",
+    "--no-profile-save",
+    "--kill-spinner",
+    "--verify",
+    "--verify-local-save",
+    "--no-force-prologue-skip",   # former name of --no-tutorial-guards
+    "--help",
+}
+
+USAGE = """usage: patch_tasm2.py [flags] <input_binary> <output_binary>
+       patch_tasm2.py --verify [flags] <patched_binary>
+
+flags:
+  --no-local-save          leave the 17 save objects server-persisted
+  --no-persist-chapter     do not carry the story chapter in ud_QuestManager
+  --no-tutorial-guards     let the tutorial bitmask be wiped on restore
+  --no-profile-save        leave save object 16 unwritable
+  --kill-spinner           remove the waiting spinner (BREAKS the skills menu)
+  --verify                 re-check every edit on an already-patched binary
+  --verify-local-save      re-check the local-save edit only
+  --help, -h               this text
+
+  --no-force-prologue-skip is accepted as the former name of
+  --no-tutorial-guards. Any other unknown flag is an error, so a typo cannot
+  silently drop an edit."""
 
 
 def macho_info(data):
@@ -99,6 +143,136 @@ def arm64_sections(data, base):
     return out
 
 
+def text_section(data):
+    """
+    (vmaddr, file_offset, size) of the arm64 __text, or (None, None, None).
+
+    Every site lookup goes through this rather than indexing the section dict,
+    so a slice without __text produces the same clean message as every other
+    malformed input instead of a KeyError traceback.
+    """
+    base, _size = arm64_slice_off(data)
+    if base is None:
+        return None, None, None
+    sects = arm64_sections(data, base)
+    if "__text" not in sects:
+        return None, None, None
+    return sects["__text"]
+
+
+def aligned_hits(text, sig):
+    """
+    Every 4-byte-aligned occurrence of `sig` in `text`.
+
+    arm64 instructions are all four bytes and __text starts aligned, so a match
+    at an odd offset is not an instruction sequence -- it is the tail of one
+    instruction plus the head of the next. Writing there corrupts both, and a
+    plain `find` loop would have reported that as a successful patch and let
+    --verify confirm it.
+    """
+    hits, i = [], 0
+    while True:
+        i = text.find(sig, i)
+        if i < 0:
+            break
+        if i % 4 == 0:
+            hits.append(i)
+        i += 1
+    return hits
+
+
+PROFILE_SKIP_WORD = 0x52800000          # mov w0, #0
+# The predicate `bl` sits this far before the ADD that forms the string address.
+PROFILE_SKIP_BACK = 0x24
+# An ADRP and the ADD that completes it are emitted together. Anything further
+# apart is a stale page left in the register table by an unrelated function,
+# not a reference -- and __cstring packs many strings onto one page, so a stale
+# entry plus a coincidental immediate can form the right address by accident.
+# Eight instructions is generous for this compiler.
+ADRP_ADD_WINDOW = 8 * 4
+
+
+def find_profile_skip_site(data, accept_patched=False):
+    """
+    Locate the `bl <predicate>` that guards UI_DOWNLOADING_PROFILE, through the
+    single reference to the string. Returns (file_offset, error).
+
+    On the 1.3.1 binary this resolves to 0x1000ab7b8.
+
+    Candidates are collected rather than taken first-come, and exactly one must
+    survive both filters -- the ADRP/ADD proximity window and "the word 0x24
+    earlier really is a BL". Taking the first match would patch a wrong call
+    site in silence if a stale register value ever produced one.
+
+    `accept_patched` widens the second filter to also accept a site already
+    holding `mov w0, #0`, so verification can re-locate a patched binary. It is
+    off while patching on purpose: `mov w0, #0` is one of the commonest words
+    in an arm64 image and is not a call, so accepting it there would let a
+    coincidence count as a rival call site and abort a build that the old
+    first-match locator patched correctly.
+    """
+    base, size = arm64_slice_off(data)
+    if base is None:
+        return None, "no arm64 slice"
+    sects = arm64_sections(data, base)
+    if "__cstring" not in sects or "__text" not in sects:
+        return None, "missing __cstring or __text"
+    cs_addr, cs_off, cs_size = sects["__cstring"]
+    tx_addr, tx_off, tx_size = sects["__text"]
+
+    # 1) virtual address of the string, which must be unique and start-aligned
+    blob = bytes(data[cs_off:cs_off + cs_size])
+    i = blob.find(b"UI_DOWNLOADING_PROFILE\x00")
+    if i < 0:
+        return None, "UI_DOWNLOADING_PROFILE not found in __cstring"
+    if i != 0 and blob[i - 1] != 0:
+        return None, "UI_DOWNLOADING_PROFILE is not at a string boundary"
+    if blob.find(b"UI_DOWNLOADING_PROFILE\x00", i + 1) >= 0:
+        return None, "UI_DOWNLOADING_PROFILE occurs more than once in __cstring"
+    sva = cs_addr + i
+
+    # 2) every ADRP+ADD pair in __text that forms that address
+    text = bytes(data[tx_off:tx_off + tx_size])
+    n = tx_size // 4
+    insns = struct.unpack_from("<%dI" % n, text, 0)
+    regpage = {}        # reg -> (page, pc of the ADRP that set it)
+    adds = []
+    for k in range(n):
+        insn = insns[k]
+        pc = tx_addr + k * 4
+        if (insn & 0x9F000000) == 0x90000000:  # ADRP
+            immlo = (insn >> 29) & 3
+            immhi = (insn >> 5) & 0x7FFFF
+            imm = (immhi << 2 | immlo)
+            if imm & (1 << 20):
+                imm -= (1 << 21)
+            regpage[insn & 0x1F] = ((pc & ~0xFFF) + (imm << 12), pc)
+        elif (insn & 0xFF000000) == 0x91000000:  # ADD immediate
+            rn = (insn >> 5) & 0x1F
+            if rn in regpage:
+                page, adrp_pc = regpage[rn]
+                imm = (insn >> 10) & 0xFFF
+                if (insn >> 22) & 1:
+                    imm <<= 12
+                if page + imm == sva and pc - adrp_pc <= ADRP_ADD_WINDOW:
+                    adds.append(pc)
+
+    # 3) the predicate `bl` sits PROFILE_SKIP_BACK before that ADD
+    sites = []
+    for add_pc in adds:
+        call_off = tx_off + (add_pc - PROFILE_SKIP_BACK - tx_addr)
+        if call_off < tx_off or call_off + 4 > tx_off + tx_size:
+            continue
+        word = struct.unpack("<I", data[call_off:call_off + 4])[0]
+        if ((word & 0xFC000000) == 0x94000000
+                or (accept_patched and word == PROFILE_SKIP_WORD)):
+            sites.append(call_off)
+    if len(sites) != 1:
+        return None, (f"expected 1 call site, found {len(sites)} "
+                      f"(from {len(adds)} string references)")
+    return sites[0], None
+
+
 def patch_profile_skip(m):
     """
     Main patch. Just before displaying UI_DOWNLOADING_PROFILE, the update loop
@@ -110,63 +284,54 @@ def patch_profile_skip(m):
     Only this one call site is touched; the shared predicate itself is called
     from ~50 other places and is left untouched.
 
-    Self-locating through the single reference to the UI_DOWNLOADING_PROFILE
-    string, hence robust. Returns (ok, file_offset) or (False, None).
+    Returns (ok, file_offset, error); nothing is written on error.
     """
-    base, size = arm64_slice_off(m)
+    off, err = find_profile_skip_site(m)
+    if err:
+        return False, None, err
+    m[off:off + 4] = struct.pack("<I", PROFILE_SKIP_WORD)
+    return True, off, None
+
+
+def verify_profile_skip(data):
+    """
+    Check the main patch on an already-patched binary: the call site must
+    re-locate and hold `mov w0, #0` instead of the original `bl`.
+
+    Without this the one edit whose absence aborts the build was also the one
+    edit never re-checked on the binary that ships.
+    """
+    off, err = find_profile_skip_site(data, accept_patched=True)
+    if err:
+        return [f"profile skip: {err}"]
+    word = struct.unpack("<I", data[off:off + 4])[0]
+    if word != PROFILE_SKIP_WORD:
+        return [f"profile skip: call site holds {word:#010x}, expected "
+                f"{PROFILE_SKIP_WORD:#010x} (mov w0,#0)"]
+    return []
+
+
+def jb_func_in_text(data):
+    """True when JB_FUNC_FILEOFF lands inside the arm64 __text section."""
+    base, size = arm64_slice_off(data)
     if base is None:
-        return False, None
-    sects = arm64_sections(m, base)
-    if "__cstring" not in sects or "__text" not in sects:
-        return False, None
-    cs_addr, cs_off, cs_size = sects["__cstring"]
-    tx_addr, tx_off, tx_size = sects["__text"]
+        return False
+    sects = arm64_sections(data, base)
+    if "__text" not in sects:
+        return False
+    _tx_addr, tx_off, tx_size = sects["__text"]
+    return tx_off <= JB_FUNC_FILEOFF and JB_FUNC_FILEOFF + 8 <= tx_off + tx_size
 
-    # 1) virtual address of the string
-    blob = m[cs_off:cs_off + cs_size]
-    i = blob.find(b"UI_DOWNLOADING_PROFILE\x00")
-    if i < 0 or (i != 0 and blob[i - 1] != 0):
-        return False, None
-    sva = cs_addr + i
 
-    # 2) scan __text for the ADRP+ADD pair that forms that address
-    text = m[tx_off:tx_off + tx_size]
-    n = tx_size // 4
-    insns = struct.unpack_from("<%dI" % n, text, 0)
-    regpage = {}
-    add_addr = None
-    for k in range(n):
-        insn = insns[k]
-        pc = tx_addr + k * 4
-        if (insn & 0x9F000000) == 0x90000000:  # ADRP
-            immlo = (insn >> 29) & 3
-            immhi = (insn >> 5) & 0x7FFFF
-            imm = (immhi << 2 | immlo)
-            if imm & (1 << 20):
-                imm -= (1 << 21)
-            regpage[insn & 0x1F] = (pc & ~0xFFF) + (imm << 12)
-        elif (insn & 0xFF000000) == 0x91000000:  # ADD immediate
-            rn = (insn >> 5) & 0x1F
-            if rn in regpage:
-                imm = (insn >> 10) & 0xFFF
-                if (insn >> 22) & 1:
-                    imm <<= 12
-                if regpage[rn] + imm == sva:
-                    add_addr = pc
-                    break
-    if add_addr is None:
-        return False, None
-
-    # 3) the predicate `bl` sits 0x24 before that ADD; make sure it is a BL
-    call_pc = add_addr - 0x24
-    call_off = tx_off + (call_pc - tx_addr)
-    old = struct.unpack("<I", m[call_off:call_off + 4])[0]
-    if (old & 0xFC000000) != 0x94000000:  # not a BL -> write nothing
-        return False, None
-
-    # 4) mov w0, #0
-    m[call_off:call_off + 4] = struct.pack("<I", 0x52800000)
-    return True, call_off
+def verify_jb_func(data):
+    """Informational: the jailbreak edit is complementary, so this never
+    aborts a build on its own -- see the note next to JB_FUNC_FILEOFF."""
+    if not jb_func_in_text(data):
+        return [f"{JB_FUNC_LABEL}: offset {JB_FUNC_FILEOFF} is outside the "
+                f"arm64 __text section"]
+    if bytes(data[JB_FUNC_FILEOFF:JB_FUNC_FILEOFF + 8]) != JB_FUNC_PATCH:
+        return [f"{JB_FUNC_LABEL}: not patched at the expected offset"]
+    return []
 
 
 # --- local save -------------------------------------------------------------
@@ -217,23 +382,13 @@ def patch_local_save(m):
     is None on success or a message when the site could not be located
     unambiguously, in which case nothing is written.
     """
-    base, size = arm64_slice_off(m)
-    if base is None:
-        return [], "no arm64 slice"
-    sects = arm64_sections(m, base)
-    if "__text" not in sects:
-        return [], "no __text section"
-    tx_addr, tx_off, tx_size = sects["__text"]
+    tx_addr, tx_off, tx_size = text_section(m)
+    if tx_off is None:
+        return [], "no arm64 __text section"
     text = bytes(m[tx_off:tx_off + tx_size])
 
     label, sig = LOCAL_SAVE_SITE
-    hits, i = [], 0
-    while True:
-        i = text.find(sig, i)
-        if i < 0:
-            break
-        hits.append(i)
-        i += 1
+    hits = aligned_hits(text, sig)
     if len(hits) != 1:
         return [], f"{label}: expected 1 match, found {len(hits)}"
 
@@ -250,17 +405,15 @@ def verify_local_save(data):
     store must be present exactly once. Run against the binary that actually
     ships, after it has been copied back into the bundle and rezipped.
     """
-    base, size = arm64_slice_off(data)
-    if base is None:
-        return ["no arm64 slice"]
-    sects = arm64_sections(data, base)
-    tx_addr, tx_off, tx_size = sects["__text"]
+    tx_addr, tx_off, tx_size = text_section(data)
+    if tx_off is None:
+        return ["no arm64 __text section"]
     text = bytes(data[tx_off:tx_off + tx_size])
     label, sig = LOCAL_SAVE_SITE
     problems = []
-    if sig in text:
+    if aligned_hits(text, sig):
         problems.append(f"{label}: original cbz still present")
-    n = text.count(sig[:4] + LOCAL_SAVE_STORE)
+    n = len(aligned_hits(text, sig[:4] + LOCAL_SAVE_STORE))
     if n != 1:
         problems.append(f"{label}: expected 1 patched site, found {n}")
     return problems
@@ -271,11 +424,9 @@ def verify_chapter(data):
     Same, for the chapter patch: both original words must be gone and both
     rewritten words present exactly once, in the same instruction pair.
     """
-    base, size = arm64_slice_off(data)
-    if base is None:
-        return ["no arm64 slice"]
-    sects = arm64_sections(data, base)
-    tx_addr, tx_off, tx_size = sects["__text"]
+    tx_addr, tx_off, tx_size = text_section(data)
+    if tx_off is None:
+        return ["no arm64 __text section"]
     text = bytes(data[tx_off:tx_off + tx_size])
     problems = []
     sites = list(CHAPTER_SITES) + [
@@ -283,11 +434,11 @@ def verify_chapter(data):
          struct.unpack("<I", CHAPTER_LOCAL_STORE)[0]),
     ]
     for label, sig, idx, word in sites:
-        if sig in text:
+        if aligned_hits(text, sig):
             problems.append(f"{label}: original instruction still present")
         patched = bytearray(sig)
         patched[idx * 4:idx * 4 + 4] = struct.pack("<I", word)
-        n = text.count(bytes(patched))
+        n = len(aligned_hits(text, bytes(patched)))
         if n != 1:
             problems.append(f"{label}: expected 1 patched site, found {n}")
     return problems
@@ -413,11 +564,9 @@ def patch_chapter_persist(m):
     Make ud_QuestManager carry progressMgr+0x2a4 (chapter) in place of +0x2dc
     (current mission). Returns (sites, error); nothing is written on error.
     """
-    base, size = arm64_slice_off(m)
-    if base is None:
-        return [], "no arm64 slice"
-    sects = arm64_sections(m, base)
-    tx_addr, tx_off, tx_size = sects["__text"]
+    tx_addr, tx_off, tx_size = text_section(m)
+    if tx_off is None:
+        return [], "no arm64 __text section"
     text = bytes(m[tx_off:tx_off + tx_size])
 
     sites = list(CHAPTER_SITES) + [
@@ -427,13 +576,7 @@ def patch_chapter_persist(m):
 
     planned = []
     for label, sig, idx, word in sites:
-        hits, i = [], 0
-        while True:
-            i = text.find(sig, i)
-            if i < 0:
-                break
-            hits.append(i)
-            i += 1
+        hits = aligned_hits(text, sig)
         if len(hits) != 1:
             return [], f"{label}: expected 1 match, found {len(hits)}"
         planned.append((label, tx_off + hits[0] + idx * 4, word))
@@ -445,57 +588,41 @@ def patch_chapter_persist(m):
     return done, None
 
 
-# --- overriding the prologue, when restoring the chapter is not enough --------
+# --- the tutorial-bitmask guards --------------------------------------------
 #
-# Device data, third run: ud_QuestManager.sav holds (250454, 1). The chapter is
-# written correctly now. The prologue still replays and ud_Tutorial.sav still
-# regresses, which means the value is not reaching progressMgr+0x2a4 on the way
-# back in.
+# Two paths threw the restored bitmask away, and device data caught both.
 #
-# The restore order is not the explanation. The manager's object array
-# (mgr+0xa40, walked in order by ReloadAll) is filled at 0x100218d00 from stack
-# spills, and resolving those gives position 8 = the quest object (mgr+0x568,
-# the one that carries the chapter) and position 10 = the tutorial object
-# (mgr+0x6c8). The chapter is restored two objects *before* the tutorial reads
-# it, so a working restore would have spared the bitmask. It did not.
+#     0x1003cc5f4   cbz w0, +0x14      ->  nop
+#         The tutorial deserialiser calls 0x1001f9388 ("chapter != 0") and,
+#         when the chapter is 0, branches to its own `str wzr,[x19,#4]`. On a
+#         fresh install the chapter is 0, so the saved value was read back and
+#         discarded in the same breath.
 #
-# Why the restore does not land is still open. What can be closed is the
-# behaviour, by taking the chapter out of both decisions:
+#     0x1003cc5b8   str wzr, [x0, #4]  ->  nop
+#         CTutorialMgr::Reset is `str wzr,[x0,#4] ; ret` -- it zeroes the whole
+#         bitmask. Its single caller is the tail of the script dispatcher at
+#         0x1001205ec, i.e. the game's own scripts ask for it, and one of them
+#         runs every time the opening sequence plays: the restore puts 137022
+#         back and the script wipes it to 0 seconds later, which is exactly the
+#         137022 -> 62 seen on device with the deserialiser already patched.
+#         Neutralise the store and the method becomes a no-op, so nothing can
+#         discard tutorial progress once it is earned.
 #
-#     0x1001fc868   cbnz w8, +0xc   ->  b +0xc
-#         the launch check stops asking whether the chapter is 0, so
-#         "story01_mission01" is never requested again.
+# Measured on device: 132926 -> 54 before, 132926 -> 153406 -> 161790 after.
 #
-#     0x1003cc5f4   cbz w0, +0x14   ->  nop
-#         the tutorial deserialiser stops branching to its `str wzr,[x19,#4]`,
-#         so the saved bitmask is read back whatever the chapter says.
+# These guards do NOT skip the prologue, and nothing here does. A third edit
+# that did (0x1001fc868 cbnz -> b) shipped for a while and has been REMOVED: it
+# cost the game its opening cinematic, the first thing story01_mission01 plays,
+# and the profile save patch made it unnecessary. On a fresh install the
+# chapter is 0, so the prologue runs exactly once; completing it writes 1
+# through 0x1001edd54, and ud_QuestManager.sav restores that on every later
+# launch, so the request never fires again.
 #
-# This is an override, not a restoration: a genuinely fresh install will start
-# in the open world instead of the prologue. That is a deliberate trade -- the
-# prologue replaying forever is the bug being fixed, and the game has no other
-# way to know it has already been played. Disable with --no-force-prologue-skip
-# to get the faithful behaviour back.
+# Disable with --no-tutorial-guards.
 
-# The "never re-request the prologue" edit that used to live here
-# (0x1001fc868 cbnz -> b) has been REMOVED. It was a stopgap from before the
-# profile save patch, and it cost the game its opening cinematic, which is the
-# first thing story01_mission01 plays. It is no longer needed: on a fresh
-# install the chapter is 0, the prologue runs exactly once, and completing it
-# writes 1 through 0x1001edd54, which ud_QuestManager.sav then restores on
-# every later launch. The two tutorial-bitmask guards below stay -- they are
-# what stops earned progress being thrown away.
-
-PROLOGUE_SITES = [
+TUTORIAL_GUARD_SITES = [
     ("never wipe the tutorial bitmask on restore (0x1003cc5f4)",
      bytes.fromhex("66b3f897a0000034e00314aa"), 1, 0xD503201F),  # nop
-    # CTutorialMgr::Reset is `str wzr,[x0,#4] ; ret` -- it zeroes the whole
-    # bitmask. Its single caller is the tail of the script dispatcher at
-    # 0x1001205ec, i.e. the game's own scripts ask for it, and one of them runs
-    # every time the opening sequence plays: the restore puts 137022 back and
-    # the script wipes it to 0 seconds later, which is exactly the 137022 -> 62
-    # seen on device with the deserialiser already patched. Neutralise the
-    # store and the method becomes a no-op, so nothing can discard tutorial
-    # progress once it is earned.
     ("neuter CTutorialMgr::Reset (0x1003cc5b8)",
      bytes.fromhex("c0035fd61f0400b9c0035fd6080440b9"), 1, 0xD503201F),  # nop
 ]
@@ -503,22 +630,14 @@ PROLOGUE_SITES = [
 
 def _apply_sites(m, sites, what):
     """Apply a list of (label, signature, word_index, replacement) sites."""
-    base, size = arm64_slice_off(m)
-    if base is None:
-        return [], "no arm64 slice"
-    sects = arm64_sections(m, base)
-    tx_addr, tx_off, tx_size = sects["__text"]
+    tx_addr, tx_off, tx_size = text_section(m)
+    if tx_off is None:
+        return [], "no arm64 __text section"
     text = bytes(m[tx_off:tx_off + tx_size])
 
     planned = []
     for label, sig, idx, word in sites:
-        hits, i = [], 0
-        while True:
-            i = text.find(sig, i)
-            if i < 0:
-                break
-            hits.append(i)
-            i += 1
+        hits = aligned_hits(text, sig)
         if len(hits) != 1:
             return [], f"{label}: expected 1 match, found {len(hits)}"
         planned.append((label, tx_off + hits[0] + idx * 4, word))
@@ -531,19 +650,17 @@ def _apply_sites(m, sites, what):
 
 
 def _verify_sites(data, sites):
-    base, size = arm64_slice_off(data)
-    if base is None:
-        return ["no arm64 slice"]
-    sects = arm64_sections(data, base)
-    tx_addr, tx_off, tx_size = sects["__text"]
+    tx_addr, tx_off, tx_size = text_section(data)
+    if tx_off is None:
+        return ["no arm64 __text section"]
     text = bytes(data[tx_off:tx_off + tx_size])
     problems = []
     for label, sig, idx, word in sites:
-        if sig in text:
+        if aligned_hits(text, sig):
             problems.append(f"{label}: original instruction still present")
         patched = bytearray(sig)
         patched[idx * 4:idx * 4 + 4] = struct.pack("<I", word)
-        n = text.count(bytes(patched))
+        n = len(aligned_hits(text, bytes(patched)))
         if n != 1:
             problems.append(f"{label}: expected 1 patched site, found {n}")
     return problems
@@ -654,16 +771,89 @@ def verify_spinner(data):
     return _verify_sites(data, SPINNER_SITES)
 
 
-def patch_prologue(m):
-    return _apply_sites(m, PROLOGUE_SITES, "prologue override")
+# --- an edit that must NOT be there -----------------------------------------
+#
+# 0x1001fc868 cbnz -> b shipped for a while and was removed (see the tutorial
+# guards above): it cost the game its opening cinematic. Every check in this
+# file asserts that an expected edit is *present*, so none of them could tell a
+# binary built by this patcher from one built by the version that still carried
+# that edit. This one asserts the absence.
+#
+# On the 1.3.1 binary the word at 0x1001fc868 is 0x35000068 (`cbnz w8, +0xc`),
+# unchanged in the shipped v1.0 release. Only a `b` there is a failure; any
+# other word means this is not the analysed build and there is nothing to
+# assert, so the check cannot raise a false alarm.
+PROLOGUE_SKIP_VA = 0x1001fc868
+PROLOGUE_SKIP_LABEL = "the removed prologue-skip edit is absent (0x1001fc868)"
 
 
-def verify_prologue(data):
-    return _verify_sites(data, PROLOGUE_SITES)
+def verify_hosts(data):
+    """
+    No live Gameloft host left. Three checks, because each catches what the
+    others miss: the URL form finds any gameloft.com host carrying a scheme,
+    the HOSTS list finds the ones we know about with or without one, and the
+    bare form finds a host nobody listed appearing without a scheme.
+
+    Two things legitimately survive on the 1.3.1 binary and must not be
+    reported, which is why a plain `grep gameloft\\.com` cannot do this job:
+    the obfuscated `jngbmfbds_gameloft.com` (an underscore, not a dot, so it
+    is not a hostname as written) and the `<your_gl_account>@gameloft.com`
+    placeholder. Build paths are excluded the same way the rewriter excludes
+    them.
+
+    Shared by the patch path and --verify, so the check that gates the release
+    is the same code that gated the build.
+    """
+    problems = []
+    urls = re.findall(rb"https?://[a-z0-9.-]*gameloft\.com", data)
+    known = [h for h in HOSTS if h in data]
+    bare = []
+    for mt in re.finditer(rb"[a-z0-9][a-z0-9.-]*\.gameloft\.com", data):
+        ctx = data[max(0, mt.start() - 130):mt.end() + 130]
+        if b"/Users/gameloft" in ctx or b"<your_gl" in ctx:
+            continue
+        bare.append(mt.group())
+    if urls or known or bare:
+        problems.append(f"{len(urls)} Gameloft URLs, {len(known)} known "
+                        f"hostnames and {len(bare)} unlisted hostnames "
+                        f"still live")
+        for h in dict.fromkeys(known + bare):
+            problems.append(f"  still present: {h.decode()}")
+    return problems
 
 
-def patch(data, local_save=True, chapter=True, prologue=True,
+def verify_prologue_not_skipped(data):
+    tx_addr, tx_off, tx_size = text_section(data)
+    if tx_off is None:
+        return ["no arm64 __text section"]
+    off = tx_off + (PROLOGUE_SKIP_VA - tx_addr)
+    if off < tx_off or off + 4 > tx_off + tx_size:
+        return []
+    word = struct.unpack("<I", data[off:off + 4])[0]
+    if (word & 0xFC000000) == 0x14000000:      # B -- the removed edit is in
+        return [f"{PROLOGUE_SKIP_LABEL}: found `b` ({word:#010x}), so this "
+                f"binary carries the prologue-skip edit and has lost its "
+                f"opening cinematic"]
+    return []
+
+
+def patch_tutorial_guards(m):
+    return _apply_sites(m, TUTORIAL_GUARD_SITES, "tutorial guards")
+
+
+def verify_tutorial_guards(data):
+    return _verify_sites(data, TUTORIAL_GUARD_SITES)
+
+
+def patch(data, local_save=True, chapter=True, tutorial_guards=True,
           profile_save=True, spinner=False):
+    """
+    Apply the edits and return (patched_bytes, report).
+
+    `report` is a dict rather than a positional tuple: there are nine
+    independent results to carry, and threading a tenth through a tuple is how
+    a caller ends up silently reading the wrong one.
+    """
     m = bytearray(data)
     patches = []
     pat = re.compile(rb"[\x20-\x7e]{6,130}")
@@ -688,6 +878,40 @@ def patch(data, local_save=True, chapter=True, prologue=True,
     for off, s, new in patches:
         m[off:off + len(s)] = new
 
+    # Second pass. The scan above bounds a printable run at 130 characters, so
+    # a host straddling a run boundary is never offered to it. Match the host
+    # bytes directly to catch those: same bytes, same length, same in-place
+    # write, so this is a safety net rather than a different edit -- and it is
+    # what makes the "no live host left" check at the end of main() honest for
+    # bare hostnames as well as full URLs.
+    #
+    # One snapshot is enough: every replacement is the same length as what it
+    # replaces and contains no host bytes, so no earlier write can create or
+    # destroy a later occurrence.
+    snapshot = bytes(m)
+    for host in HOSTS:
+        repl = b"x" * (len(host) - len(b".invalid")) + b".invalid"
+        if len(repl) != len(host):
+            # The first pass raises on a length change; this one must too. A
+            # replacement shorter than what it replaces RESIZES the bytearray
+            # and shifts every Mach-O offset after it -- main()'s size check
+            # would only notice long after the signature edits had run against
+            # a shifted buffer.
+            raise RuntimeError(f"host replacement length changed: "
+                               f"{len(host)} -> {len(repl)}")
+        i = 0
+        while True:
+            i = snapshot.find(host, i)
+            if i < 0:
+                break
+            ctx = snapshot[max(0, i - 130):i + len(host) + 130]
+            if b"/Users/gameloft" in ctx or b"<your_gl" in ctx:
+                i += len(host)
+                continue
+            m[i:i + len(host)] = repl
+            patches.append((i, host, repl))
+            i += len(host)
+
     # --- jailbreak detection paths ---
     jb = []
     for p in JB_PATHS:
@@ -704,16 +928,14 @@ def patch(data, local_save=True, chapter=True, prologue=True,
             i += 1
 
     # --- jailbreak detection function (arm64) ---
-    JB_FUNC_FILEOFF = 19016508
-    JB_FUNC_ORIG = bytes.fromhex("ff0303d1f44f0aa9")
-    JB_FUNC_PATCH = struct.pack("<II", 0x52800000, 0xD65F03C0)  # mov w0,#0 ; ret
     fn_ok = False
-    if m[JB_FUNC_FILEOFF:JB_FUNC_FILEOFF + 8] == JB_FUNC_ORIG:
+    if (jb_func_in_text(m)
+            and bytes(m[JB_FUNC_FILEOFF:JB_FUNC_FILEOFF + 8]) == JB_FUNC_ORIG):
         m[JB_FUNC_FILEOFF:JB_FUNC_FILEOFF + 8] = JB_FUNC_PATCH
         fn_ok = True
 
     # --- MAIN PATCH: skip the profile download ---
-    skip_ok, skip_off = patch_profile_skip(m)
+    skip_ok, skip_off, skip_err = patch_profile_skip(m)
 
     # --- LOCAL SAVE: persist every save object to ud_<Name>.sav ---
     ls_sites, ls_err = patch_local_save(m) if local_save else ([], None)
@@ -721,8 +943,9 @@ def patch(data, local_save=True, chapter=True, prologue=True,
     # --- optional: carry the story chapter in the local save ---
     ch_sites, ch_err = patch_chapter_persist(m) if chapter else ([], None)
 
-    # --- optional: override the prologue decision outright ---
-    pr_sites, pr_err = patch_prologue(m) if prologue else ([], None)
+    # --- optional: keep the tutorial bitmask from being wiped ---
+    tg_sites, tg_err = (patch_tutorial_guards(m) if tutorial_guards
+                        else ([], None))
 
     # --- optional: let the local profile object reach disk ---
     ps_sites, ps_err = patch_profile_save(m) if profile_save else ([], None)
@@ -730,46 +953,86 @@ def patch(data, local_save=True, chapter=True, prologue=True,
     # --- optional: never show the network waiting spinner ---
     sp_sites, sp_err = patch_spinner(m) if spinner else ([], None)
 
-    return (bytes(m), patches, jb, fn_ok, skip_ok, skip_off, ls_sites, ls_err,
-            ch_sites, ch_err, pr_sites, pr_err, ps_sites, ps_err,
-            sp_sites, sp_err)
+    return bytes(m), {
+        "strings": patches,
+        "jb_paths": jb,
+        "jb_func": fn_ok,
+        "skip": (skip_ok, skip_off, skip_err),
+        "local_save": (ls_sites, ls_err),
+        "chapter": (ch_sites, ch_err),
+        "tutorial_guards": (tg_sites, tg_err),
+        "profile_save": (ps_sites, ps_err),
+        "spinner": (sp_sites, sp_err),
+    }
 
 
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    flags = {a for a in sys.argv[1:] if a.startswith("--")}
+    argv = sys.argv[1:]
+    if {"--help", "-h"} & set(argv):
+        print(USAGE)
+        return 0
+
+    args = [a for a in argv if not a.startswith("-")]
+    flags = {a for a in argv if a.startswith("-")}
+
+    unknown = sorted(flags - KNOWN_FLAGS)
+    if unknown:
+        # A silently ignored typo yields a binary missing an edit nobody asked
+        # to skip -- exactly the failure the rest of this script is built to
+        # make impossible.
+        print(f"ERROR: unknown flag(s): {' '.join(unknown)}")
+        print(f"known flags: {' '.join(sorted(KNOWN_FLAGS))}")
+        return 1
 
     local_save = "--no-local-save" not in flags
     chapter = "--no-persist-chapter" not in flags
-    prologue = "--no-force-prologue-skip" not in flags
+    # --no-force-prologue-skip was this flag's name while it also carried an
+    # edit that skipped the prologue. That edit is gone; the old name keeps
+    # working so an existing workflow input does not silently change meaning.
+    tutorial_guards = not (flags & {"--no-tutorial-guards",
+                                    "--no-force-prologue-skip"})
     profile_save = "--no-profile-save" not in flags
     spinner = "--kill-spinner" in flags
 
     if flags & {"--verify", "--verify-local-save"}:
         if len(args) != 1:
-            print("usage: patch_tasm2.py --verify [--no-local-save] "
-                  "[--no-persist-chapter] <patched_binary>")
+            print(USAGE)
             return 1
         data = open(args[0], "rb").read()
-        problems, checked = [], []
+        problems, checked, notes = [], [], []
+        full = "--verify-local-save" not in flags
+        if full:
+            problems += verify_profile_skip(data)
+            checked.append("skip UI_DOWNLOADING_PROFILE -> UI_FIRST_CHECK")
+            problems += verify_prologue_not_skipped(data)
+            checked.append(PROLOGUE_SKIP_LABEL)
+            problems += verify_hosts(data)
+            checked.append("no live Gameloft host left")
         if local_save:
             problems += verify_local_save(data)
             checked.append(LOCAL_SAVE_SITE[0])
-        if chapter and "--verify-local-save" not in flags:
+        if chapter and full:
             problems += verify_chapter(data)
             checked += [label for label, _s, _i, _w in CHAPTER_SITES]
             checked.append(CHAPTER_LOCAL_SITE[0])
-        if prologue and "--verify-local-save" not in flags:
-            problems += verify_prologue(data)
-            checked += [label for label, _s, _i, _w in PROLOGUE_SITES]
-        if profile_save and "--verify-local-save" not in flags:
+        if tutorial_guards and full:
+            problems += verify_tutorial_guards(data)
+            checked += [label for label, _s, _i, _w in TUTORIAL_GUARD_SITES]
+        if profile_save and full:
             problems += verify_profile_save(data)
             checked += [label for label, _s, _i, _w in PROFILE_SAVE_SITES]
-        if spinner and "--verify-local-save" not in flags:
+        if spinner and full:
             problems += verify_spinner(data)
             checked += [label for label, _s, _i, _w in SPINNER_SITES]
+        if full:
+            # Complementary, so it is reported and never fatal.
+            notes += verify_jb_func(data)
+            if not notes:
+                checked.append(JB_FUNC_LABEL)
         for p in problems:
             print(f"FAIL: {p}")
+        for n in notes:
+            print(f"warn: {n}")
         if problems:
             return 1
         print(f"verified in {args[0]}:")
@@ -778,10 +1041,7 @@ def main():
         return 0
 
     if len(args) != 2:
-        print("usage: patch_tasm2.py [--no-local-save] [--no-persist-chapter] "
-              "[--no-force-prologue-skip] [--no-profile-save] [--kill-spinner] "
-              "<input_binary> <output_binary>")
-        print("       patch_tasm2.py --verify <patched_binary>")
+        print(USAGE)
         return 1
 
     data = open(args[0], "rb").read()
@@ -801,10 +1061,18 @@ def main():
         name = {2: "MH_EXECUTE", 6: "MH_DYLIB"}.get(ft, str(ft))
         print(f"  {label:6} off={off:<10} size={size:<10} filetype={name}")
 
-    out, patches, jb, fn_ok, skip_ok, skip_off, ls_sites, ls_err, ch_sites, \
-        ch_err, pr_sites, pr_err, ps_sites, ps_err, sp_sites, sp_err = \
-        patch(data, local_save=local_save, chapter=chapter, prologue=prologue,
-              profile_save=profile_save, spinner=spinner)
+    out, report = patch(data, local_save=local_save, chapter=chapter,
+                        tutorial_guards=tutorial_guards,
+                        profile_save=profile_save, spinner=spinner)
+    patches = report["strings"]
+    jb = report["jb_paths"]
+    fn_ok = report["jb_func"]
+    skip_ok, skip_off, skip_err = report["skip"]
+    ls_sites, ls_err = report["local_save"]
+    ch_sites, ch_err = report["chapter"]
+    tg_sites, tg_err = report["tutorial_guards"]
+    ps_sites, ps_err = report["profile_save"]
+    sp_sites, sp_err = report["spinner"]
 
     if spinner:
         if sp_err:
@@ -828,16 +1096,19 @@ def main():
     else:
         print("\n>>> profile save skipped (--no-profile-save)")
 
-    if prologue:
-        if pr_err:
-            print(f"\n>>> ERROR: prologue override NOT applied: {pr_err}")
+    if tutorial_guards:
+        if tg_err:
+            print(f"\n>>> ERROR: tutorial guards NOT applied: {tg_err}")
         else:
-            print("\n>>> PROLOGUE override patched: the prologue is never "
-                  "re-requested, the tutorial bitmask is never wiped")
-            for label, off in pr_sites:
+            print("\n>>> TUTORIAL GUARDS patched: the tutorial bitmask is "
+                  "never wiped, on either path that used to discard it")
+            print("    (the prologue still plays once on a fresh install, "
+                  "cinematic included)")
+            for label, off in tg_sites:
                 print(f"    patched   @ file offset {off:<10} {label}")
     else:
-        print("\n>>> tutorial guards skipped (--no-force-prologue-skip)")
+        print("\n>>> tutorial guards skipped (--no-tutorial-guards): earned "
+              "tutorial progress can be discarded on restore")
 
     if chapter:
         if ch_err:
@@ -868,14 +1139,21 @@ def main():
         print(f"\n>>> MAIN PATCH applied: skip UI_DOWNLOADING_PROFILE "
               f"-> UI_FIRST_CHECK (call site @ file offset {skip_off}, mov w0,#0)")
     else:
-        print("\n>>> ERROR: main patch (profile skip) NOT applied "
-              "(call site not found) -- the game would stay blocked")
+        print(f"\n>>> ERROR: main patch (profile skip) NOT applied: {skip_err}"
+              " -- the game would stay blocked")
 
     print(f"\n{len(jb)} jailbreak detection paths neutralised")
     if fn_ok:
-        print("jailbreak detection function (arm64) patched: mov w0,#0 ; ret")
+        print(f"{JB_FUNC_LABEL}: patched (mov w0,#0 ; ret)")
     else:
-        print("WARNING: jailbreak function not found at expected offset -- NOT patched")
+        why = ("that offset falls outside the arm64 __text section"
+               if not jb_func_in_text(data) else
+               "the 8 bytes there are not the expected prologue")
+        print(f"WARNING: {JB_FUNC_LABEL}: {why} (offset {JB_FUNC_FILEOFF})"
+              " -- NOT patched.")
+        print("         Jailbreak detection stays live; everything else is "
+              "unaffected. This edit is the one that cannot self-locate, so a "
+              "binary other than the analysed 1.3.1 will miss it.")
     print(f"\n{len(patches)} strings patched:")
     for off, s, new in patches:
         print(f"  off={off:<10} {s.decode()[:58]}")
@@ -885,9 +1163,10 @@ def main():
         print("ERROR: size changed, aborting")
         return 1
 
-    remaining = re.findall(rb"https?://[a-z0-9.-]*gameloft\.com", out)
-    if remaining:
-        print(f"ERROR: {len(remaining)} Gameloft hosts still live")
+    host_problems = verify_hosts(out)
+    if host_problems:
+        for p in host_problems:
+            print(f"ERROR: {p}")
         return 1
 
     if not skip_ok:
@@ -900,8 +1179,8 @@ def main():
         print("ERROR: chapter persistence incomplete, aborting")
         return 1
 
-    if prologue and pr_err:
-        print("ERROR: prologue override incomplete, aborting")
+    if tutorial_guards and tg_err:
+        print("ERROR: tutorial guards incomplete, aborting")
         return 1
 
     if profile_save and ps_err:

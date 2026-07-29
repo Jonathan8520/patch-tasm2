@@ -8,7 +8,11 @@ on:
         required: true
         default: "https://archive.org/download/the_amazing_spider_man_2_v1_3_1_ipa_1.3.1_ios_8.0/The_Amazing_Spider_Man_2_v1_3_1_ipa_1.3.1_ios_8.0.ipa"
       patch_flags:
-        description: "Extra flags for patch_tasm2.py (e.g. --no-persist-chapter)"
+        description: >-
+          Extra flags for patch_tasm2.py, e.g. --no-persist-chapter.
+          An unknown flag now fails the build instead of being ignored.
+          --no-force-prologue-skip was renamed --no-tutorial-guards; the old
+          name still works. Leave empty for the eight shipped edits.
         required: false
         default: ""
       release_tag:
@@ -80,15 +84,31 @@ jobs:
 
       - name: Verify the result
         run: |
+          set -euo pipefail
           mkdir -p verif
           unzip -qo SpiderMan2_patched.ipa -d verif
           BIN="verif/Payload/$(ls verif/Payload | head -1)/AmazingSpiderMan2"
-          echo "size: $(stat -c%s "$BIN") (expected 33375152)"
-          echo "--- remaining gameloft hosts (must be empty) ---"
-          strings "$BIN" | grep -E 'https?://[a-z0-9.-]*gameloft\.com' || echo "none : OK"
+
+          SIZE=$(stat -c%s "$BIN")
+          echo "size: $SIZE (expected 33375152)"
+          if [ "$SIZE" != "33375152" ]; then
+            echo "FAIL: the shipped binary changed size"
+            exit 1
+          fi
+
           echo "--- injected .invalid hosts ---"
           strings "$BIN" | grep -c 'invalid' || true
-          echo "--- save patches, checked on the binary that ships ---"
+
+          # Every edit, plus "no live Gameloft host left", checked on the
+          # binary that actually ships -- after the rezip, not before.
+          #
+          # The host check lives in patch_tasm2.py rather than in a grep here,
+          # because a grep for gameloft.com has to know that the obfuscated
+          # `jngbmfbds_gameloft.com` and the `<your_gl_account>@gameloft.com`
+          # placeholder legitimately survive. The grep that used to sit here
+          # could not fail the build in any case: it ended in `|| echo "none :
+          # OK"`, so the step exited 0 whatever it printed.
+          echo "--- every edit, checked on the binary that ships ---"
           python3 patch_tasm2.py --verify ${{ github.event.inputs.patch_flags }} "$BIN"
 
       - name: Publish the IPA as a Release
