@@ -53,7 +53,7 @@ wrong, and the reason it looked right is worth recording.
 
 The game does have a complete local save system — a per-object writer and a
 symmetric reader, with the game's own serialisers on both ends. It is the
-system that stores your settings today. What it does **not** do by default is
+system that stores the settings today. What it does **not** do by default is
 apply to the objects that hold progression: those are flagged
 "server-persisted", and their blobs travelled in the Gameloft profile.
 
