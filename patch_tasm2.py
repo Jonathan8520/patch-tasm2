@@ -607,6 +607,45 @@ def verify_profile_save(data):
     return _verify_sites(data, PROFILE_SAVE_SITES)
 
 
+# --- the waiting spinner ------------------------------------------------------
+#
+# A spinner can sit on screen forever -- on the home menu, the skills page, and
+# worst of all in the shop after a purchase fails. It is driven by a mask of
+# reasons at progressMgr+0x330: 0x1001e7b94 sets bit N and shows the widget,
+# 0x1001e7f3c clears bit N and hides it once the mask reaches 0. Offline some
+# requests never answer, so their bit is never cleared and the widget never
+# goes away. 65 show sites, 66 hide sites -- there is no single request to fix.
+#
+# So stop showing it. The function is void: its epilogue returns whatever a
+# destructor left in w0, and several callers reach it by `b` rather than `bl`,
+# which only compiles for a void tail call. Turning its first instruction into
+# `ret` therefore satisfies every caller, including the tail-callers, for whom
+# it becomes an immediate return.
+#
+# What this costs: the widget also puts up an input-blocking mask, so taps are
+# no longer swallowed while one of these requests is pending. That is a real
+# trade, and it is acceptable here because this widget is the *network* wait --
+# level loading has its own full-screen loading screen, which is untouched.
+# Offline, every wait this thing reports is a request that can never succeed.
+#
+# The prologue is a common one (9 identical copies in __text), so the signature
+# runs seven words deep, to the distinctive `mov w20, #0x17fffff`.
+
+SPINNER_SITES = [
+    ("never show the network waiting spinner (0x1001e7b94)",
+     bytes.fromhex("ffc304d1f65710a9f44f11a9fd7b12a9fd830491f30300aa14d0bf12"),
+     0, 0xD65F03C0),   # ret
+]
+
+
+def patch_spinner(m):
+    return _apply_sites(m, SPINNER_SITES, "spinner")
+
+
+def verify_spinner(data):
+    return _verify_sites(data, SPINNER_SITES)
+
+
 def patch_prologue(m):
     return _apply_sites(m, PROLOGUE_SITES, "prologue override")
 
@@ -616,7 +655,7 @@ def verify_prologue(data):
 
 
 def patch(data, local_save=True, chapter=True, prologue=True,
-          profile_save=True):
+          profile_save=True, spinner=True):
     m = bytearray(data)
     patches = []
     pat = re.compile(rb"[\x20-\x7e]{6,130}")
@@ -680,8 +719,12 @@ def patch(data, local_save=True, chapter=True, prologue=True,
     # --- optional: let the local profile object reach disk ---
     ps_sites, ps_err = patch_profile_save(m) if profile_save else ([], None)
 
+    # --- optional: never show the network waiting spinner ---
+    sp_sites, sp_err = patch_spinner(m) if spinner else ([], None)
+
     return (bytes(m), patches, jb, fn_ok, skip_ok, skip_off, ls_sites, ls_err,
-            ch_sites, ch_err, pr_sites, pr_err, ps_sites, ps_err)
+            ch_sites, ch_err, pr_sites, pr_err, ps_sites, ps_err,
+            sp_sites, sp_err)
 
 
 def main():
@@ -692,6 +735,7 @@ def main():
     chapter = "--no-persist-chapter" not in flags
     prologue = "--no-force-prologue-skip" not in flags
     profile_save = "--no-profile-save" not in flags
+    spinner = "--keep-spinner" not in flags
 
     if flags & {"--verify", "--verify-local-save"}:
         if len(args) != 1:
@@ -713,6 +757,9 @@ def main():
         if profile_save and "--verify-local-save" not in flags:
             problems += verify_profile_save(data)
             checked += [label for label, _s, _i, _w in PROFILE_SAVE_SITES]
+        if spinner and "--verify-local-save" not in flags:
+            problems += verify_spinner(data)
+            checked += [label for label, _s, _i, _w in SPINNER_SITES]
         for p in problems:
             print(f"FAIL: {p}")
         if problems:
@@ -724,7 +771,7 @@ def main():
 
     if len(args) != 2:
         print("usage: patch_tasm2.py [--no-local-save] [--no-persist-chapter] "
-              "[--no-force-prologue-skip] [--no-profile-save] "
+              "[--no-force-prologue-skip] [--no-profile-save] [--keep-spinner] "
               "<input_binary> <output_binary>")
         print("       patch_tasm2.py --verify <patched_binary>")
         return 1
@@ -747,9 +794,19 @@ def main():
         print(f"  {label:6} off={off:<10} size={size:<10} filetype={name}")
 
     out, patches, jb, fn_ok, skip_ok, skip_off, ls_sites, ls_err, ch_sites, \
-        ch_err, pr_sites, pr_err, ps_sites, ps_err = \
+        ch_err, pr_sites, pr_err, ps_sites, ps_err, sp_sites, sp_err = \
         patch(data, local_save=local_save, chapter=chapter, prologue=prologue,
-              profile_save=profile_save)
+              profile_save=profile_save, spinner=spinner)
+
+    if spinner:
+        if sp_err:
+            print(f"\n>>> ERROR: spinner patch NOT applied: {sp_err}")
+        else:
+            print("\n>>> SPINNER patched: the network waiting spinner is never shown")
+            for label, off in sp_sites:
+                print(f"    patched   @ file offset {off:<10} {label}")
+    else:
+        print("\n>>> spinner left in place (--keep-spinner)")
 
     if profile_save:
         if ps_err:
@@ -840,6 +897,10 @@ def main():
 
     if profile_save and ps_err:
         print("ERROR: profile save incomplete, aborting")
+        return 1
+
+    if spinner and sp_err:
+        print("ERROR: spinner patch incomplete, aborting")
         return 1
 
     if local_save and ls_err:

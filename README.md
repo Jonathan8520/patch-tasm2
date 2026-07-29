@@ -4,7 +4,7 @@ Gameloft's servers for *The Amazing Spider-Man 2* have been dead since ~2018,
 and the iOS build hangs forever on **“Downloading profile”**. This patches the
 game so it launches, plays **and saves** entirely offline.
 
-Eight instructions, all in the arm64 slice, every one derived from the
+Nine instructions, all in the arm64 slice, every one derived from the
 disassembly and verified on the binary that actually ships. No new save
 format, no injected code, no size change.
 
@@ -40,14 +40,12 @@ tutorial state and the story cursor all survive.
 - **Anything genuinely online**: shop purchases, events, friends. The servers
   are gone; the game says so with a *“Le réseau actuel est indisponible”*
   dialog, which is honest.
-- **A waiting spinner** can stay on screen (home, skills, shop). Each pending
-  request sets a bit in a mask at `progressMgr+0x330`
-  (`0x1001e7b94` sets, `0x1001e7f3c` clears, the widget hides when the mask
-  reaches 0). Offline some requests never answer, so their bit is never
-  cleared. There are 65 show sites and 66 hide sites, so there is no single
-  point to fix; the only blunt option is to make `0x1001e7b94` return
-  immediately, which also removes the input-blocking mask it puts up during
-  real loads. Left alone deliberately.
+- **The “network unavailable” dialog** still appears now and then. It is
+  emitted from 15 separate places, each of which looks the text up and builds
+  its own message box through the same helper every other dialog in the game
+  uses — there is no shared switch to flip. Removing it would mean fifteen
+  guessed control-flow edits for the sake of one OK tap, on a build that
+  works. Left alone deliberately.
 
 ## How it works
 
@@ -164,6 +162,30 @@ enables no new code path — the file simply starts existing.
 > `0x100215920`, so its XXTEA key comes from a device secret rather than from
 > the file's own trailer.
 
+### 9. Never show the network waiting spinner — `0x1001e7b94`
+
+A spinner could sit on screen forever: on the home menu, the skills page, and
+worst of all in the shop after a failed purchase. It is driven by a mask of
+reasons at `progressMgr+0x330` — `0x1001e7b94` sets bit N and shows the
+widget, `0x1001e7f3c` clears bit N and hides it once the mask reaches 0.
+Offline some requests never answer, so their bit is never cleared. With 65 set
+sites and 66 clear sites there is no single request to fix, so the widget
+stops being shown at all:
+
+```
+0x1001e7b94   sub sp, sp, #0x130   ->   ret
+```
+
+The function is void — its epilogue returns whatever a destructor left in
+`w0`, and several callers reach it by `b` rather than `bl`, which only
+compiles for a void tail call — so every caller is satisfied, tail-callers
+included.
+
+The cost: the widget also puts up an input-blocking mask, so taps are no
+longer swallowed while one of these requests is pending. That is acceptable
+because this is the *network* wait; level loading has its own full-screen
+loading screen, untouched. Disable with `--keep-spinner`.
+
 ### Complementary edits
 
 Dead Gameloft hostnames are rewritten to `.invalid` (RFC 6761: never
@@ -181,9 +203,9 @@ Every edit preserves length exactly.
 ### Opting out
 
 `--no-local-save`, `--no-persist-chapter`, `--no-force-prologue-skip`,
-`--no-profile-save`. The patcher writes nothing if a site is missing or
-ambiguous, and `patch_tasm2.py --verify <binary>` re-checks all eight on the
-binary that ships — the build workflow runs it after rezipping.
+`--no-profile-save`, `--keep-spinner`. The patcher writes nothing if a site is
+missing or ambiguous, and `patch_tasm2.py --verify <binary>` re-checks all
+nine on the binary that ships — the build workflow runs it after rezipping.
 
 ## Tools
 
