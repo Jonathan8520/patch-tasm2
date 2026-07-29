@@ -5,9 +5,6 @@ name: Publish binary for analysis
 # the 769 MB archive every time.
 
 on:
-  push:
-    branches: ["claude/**"]
-    paths: [".github/workflows/publish-binary-for-analysis.yml"]
   workflow_dispatch:
     inputs:
       ipa_url:
