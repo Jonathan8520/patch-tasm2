@@ -1,5 +1,5 @@
-import struct, sys
-sys.path.insert(0,'/home/user/patch-tasm2/tools')
+import struct, sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from st import B,TA,TO,TS,WORDS,dec
 
 TARGET_LO, TARGET_HI = 0x2d8, 0x2dc     # byte range of the field

@@ -1,7 +1,7 @@
-import struct, sys
-sys.path.insert(0,'/home/user/patch-tasm2/tools')
+import struct, sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from machoscan import Bin
-B = Bin('/home/user/AmazingSpiderMan2')
+B = Bin(os.environ.get("TASM2_BIN", "/home/user/AmazingSpiderMan2"))
 TA, TO, TS = B.sections['__text']
 WORDS = struct.unpack('<%dI'%(TS//4), B.data[TO:TO+TS])
 

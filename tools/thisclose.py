@@ -1,4 +1,4 @@
-import sys; sys.path.insert(0,'/home/user/patch-tasm2/tools')
+import sys, os; sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from st import B,TA,TS,WORDS,dec
 import bisect
 funcs=sorted(set(B.func_starts))

@@ -1,0 +1,7 @@
+# tools/ only. `machoscan.py` disassembles with capstone and every other
+# script imports it, directly or through `st.py`.
+#
+# patch_tasm2.py itself has no dependencies at all -- re, struct, sys, hashlib
+# from the standard library -- which is why the build workflow installs
+# nothing.
+capstone>=5.0

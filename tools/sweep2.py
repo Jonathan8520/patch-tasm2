@@ -1,5 +1,5 @@
-import struct, sys, bisect
-sys.path.insert(0,'/home/user/patch-tasm2/tools')
+import struct, sys, bisect, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from st import B,TA,TO,TS,WORDS,dec
 
 LO,HI = int(sys.argv[1],16), int(sys.argv[2],16)
