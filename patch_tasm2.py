@@ -25,6 +25,11 @@ write, behind a gate that could never unlock itself. One nop opens it, and the
 story then advances offline on its own. Disable with --no-profile-save.
 See LOCAL_SAVE_DESIGN.md.
 
+Network failure (opt-in, --fail-network): the shared reachability predicate
+returns "unreachable" at all fifty of its call sites, so every request that
+would have hung until its timeout takes the game's own offline branch instead.
+This is what shortens the waiting spinner rather than deleting it.
+
 Complementary patches: dead Gameloft hosts rewritten to .invalid, jailbreak
 detection paths and function neutralised. Every edit preserves string and
 instruction lengths exactly, so no Mach-O offset is ever shifted.
@@ -76,6 +81,7 @@ KNOWN_FLAGS = {
     "--no-tutorial-guards",
     "--no-profile-save",
     "--kill-spinner",
+    "--fail-network",
     "--verify",
     "--verify-local-save",
     "--no-force-prologue-skip",   # former name of --no-tutorial-guards
@@ -91,6 +97,9 @@ flags:
   --no-tutorial-guards     let the tutorial bitmask be wiped on restore
   --no-profile-save        leave save object 16 unwritable
   --kill-spinner           remove the waiting spinner (BREAKS the skills menu)
+  --fail-network           report the network as unreachable at all 50 call
+                           sites, so every request fails at once instead of
+                           waiting for a timeout (not yet device-tested)
   --verify                 re-check every edit on an already-patched binary
   --verify-local-save      re-check the local-save edit only
   --help, -h               this text
@@ -775,6 +784,83 @@ def verify_spinner(data):
     return _verify_sites(data, SPINNER_SITES)
 
 
+# --- telling the game the network is down ------------------------------------
+#
+# The spinner is a symptom, not the disease. What raises it is a request that
+# was sent and never answered, and what answers a request offline is the HTTP
+# layer giving up on a host that no longer resolves -- slowly. Deleting the
+# widget hides the wait; refusing to start the wait removes it.
+#
+# The game already knows how to be offline. 0x100346c10 is its reachability
+# predicate: it asks Reachability for the current status, treats 1 and 2
+# (wifi, wwan) as reachable, caches the answer in the byte at 0x10107a2c8 for
+# 1000 ms, and returns it:
+#
+#     0x100346cc8   strb w8, [x9, #0x2c8]     ; cache
+#     0x100346ccc   cmp  w8, #0
+#     0x100346cd0   cset w0, ne               ->  mov w0, #0
+#     0x100346cd4   ldp  x29, x30, [sp, #0x30]
+#
+# Fifty call sites reach it, and forty-four branch on w0 within three
+# instructions. The other six keep it in a callee-saved register across an
+# ObjC release and then branch on it; none does arithmetic with it. Every one
+# of the twenty-eight containing functions is a network feature -- login and
+# datacentre selection, the shop and IAP, leaderboards, friends and mail,
+# analytics, the news/forum/support buttons, the cloud-profile upload in the
+# save manager. Nothing in the local mission server (0x100416000..0x100422000)
+# and nothing on the save/restore path calls it, so the edit cannot reach what
+# took eleven builds to get right.
+#
+# The predicate is already how this patcher unblocks the game: the main edit
+# at 0x1000ab7b8 replaces one `bl` to this very function with `mov w0, #0`, and
+# the menu it lands in is Gameloft's own no-network path. This edit is that
+# one, generalised from a single call site to all fifty.
+#
+# What it buys, concretely, is the skills screen. SP_ShowSkillTree
+# (0x1003eafe8) calls 0x1000bf130, which asks whether goods categories 6, 7 and
+# 10 are loaded, raises the spinner (reason 3) when they are not, starts the
+# fetch, and then:
+#
+#     0x1000bf21c   bl   0x100346c10
+#     0x1000bf220   tbz  w0, #0, 0x1000bf2b8   ; unreachable -> state 3
+#     0x1000bf224   mov  w8, #1                ; reachable   -> state 1
+#
+# State 1 is "waiting for the answer", and offline the answer is a timeout.
+# State 3 is the offline branch: the manager's update (0x1000b1cd0, a jump
+# table on the state at +0x88) runs 3 -> 4 -> -3 without any I/O, and the
+# handlers for states -5, -4 and -3 all call 0x1000b1c0c, which is the only
+# code in the binary that clears spinner reason 3. So the same screen, the same
+# widget, the same clearing path -- reached in a frame instead of a timeout.
+#
+# One visible change beyond the waits. The boot flow at 0x10006fad0 reads
+# "network available OR the profile file existed at startup"; with neither, it
+# shows UI_cloud_data_reminder and its OK button sets the state the other
+# branch jumped to (0x100071108: `mov w8,#0xd ; str w8,[x1,#0xb4]`). So a
+# genuinely first launch gets one extra dialog, and no launch after that, since
+# the profile save patch makes the file exist.
+#
+# Measured on this binary: the cached byte at 0x10107a2c8 is read and written
+# only inside this function (0x100346c44, 0x100346cb4, 0x100346cc8), so forcing
+# the return value cannot desynchronise anything from it, and the three-word
+# anchor below occurs exactly once in __text (the first two words alone: 63
+# times).
+#
+# Opt-in with --fail-network until it has been through a device run.
+
+NETWORK_FAIL_SITES = [
+    ("report the network as unreachable everywhere (0x100346cd0)",
+     bytes.fromhex("1f010071e0079f1afd7b43a9"), 1, 0x52800000),   # mov w0,#0
+]
+
+
+def patch_network_fail(m):
+    return _apply_sites(m, NETWORK_FAIL_SITES, "network failure")
+
+
+def verify_network_fail(data):
+    return _verify_sites(data, NETWORK_FAIL_SITES)
+
+
 # --- an edit that must NOT be there -----------------------------------------
 #
 # 0x1001fc868 cbnz -> b shipped for a while and was removed (see the tutorial
@@ -850,13 +936,13 @@ def verify_tutorial_guards(data):
 
 
 def patch(data, local_save=True, chapter=True, tutorial_guards=True,
-          profile_save=True, spinner=False):
+          profile_save=True, spinner=False, network_fail=False):
     """
     Apply the edits and return (patched_bytes, report).
 
-    `report` is a dict rather than a positional tuple: there are nine
-    independent results to carry, and threading a tenth through a tuple is how
-    a caller ends up silently reading the wrong one.
+    `report` is a dict rather than a positional tuple: there are ten
+    independent results to carry, and threading an eleventh through a tuple is
+    how a caller ends up silently reading the wrong one.
     """
     m = bytearray(data)
     patches = []
@@ -957,6 +1043,9 @@ def patch(data, local_save=True, chapter=True, tutorial_guards=True,
     # --- optional: never show the network waiting spinner ---
     sp_sites, sp_err = patch_spinner(m) if spinner else ([], None)
 
+    # --- optional: answer "no network" everywhere instead of timing out ---
+    nf_sites, nf_err = patch_network_fail(m) if network_fail else ([], None)
+
     return bytes(m), {
         "strings": patches,
         "jb_paths": jb,
@@ -967,6 +1056,7 @@ def patch(data, local_save=True, chapter=True, tutorial_guards=True,
         "tutorial_guards": (tg_sites, tg_err),
         "profile_save": (ps_sites, ps_err),
         "spinner": (sp_sites, sp_err),
+        "network_fail": (nf_sites, nf_err),
     }
 
 
@@ -997,6 +1087,7 @@ def main():
                                     "--no-force-prologue-skip"})
     profile_save = "--no-profile-save" not in flags
     spinner = "--kill-spinner" in flags
+    network_fail = "--fail-network" in flags
 
     if flags & {"--verify", "--verify-local-save"}:
         if len(args) != 1:
@@ -1028,6 +1119,9 @@ def main():
         if spinner and full:
             problems += verify_spinner(data)
             checked += [label for label, _s, _i, _w in SPINNER_SITES]
+        if network_fail and full:
+            problems += verify_network_fail(data)
+            checked += [label for label, _s, _i, _w in NETWORK_FAIL_SITES]
         if full:
             # Complementary, so it is reported and never fatal.
             notes += verify_jb_func(data)
@@ -1067,7 +1161,8 @@ def main():
 
     out, report = patch(data, local_save=local_save, chapter=chapter,
                         tutorial_guards=tutorial_guards,
-                        profile_save=profile_save, spinner=spinner)
+                        profile_save=profile_save, spinner=spinner,
+                        network_fail=network_fail)
     patches = report["strings"]
     jb = report["jb_paths"]
     fn_ok = report["jb_func"]
@@ -1077,6 +1172,19 @@ def main():
     tg_sites, tg_err = report["tutorial_guards"]
     ps_sites, ps_err = report["profile_save"]
     sp_sites, sp_err = report["spinner"]
+    nf_sites, nf_err = report["network_fail"]
+
+    if network_fail:
+        if nf_err:
+            print(f"\n>>> ERROR: network failure patch NOT applied: {nf_err}")
+        else:
+            print("\n>>> NETWORK reported unreachable: every request now fails "
+                  "at once instead of waiting for a timeout")
+            for label, off in nf_sites:
+                print(f"    patched   @ file offset {off:<10} {label}")
+    else:
+        print("\n>>> network left as the device reports it (--fail-network to "
+              "force 'no network' everywhere)")
 
     if spinner:
         if sp_err:
@@ -1193,6 +1301,10 @@ def main():
 
     if spinner and sp_err:
         print("ERROR: spinner patch incomplete, aborting")
+        return 1
+
+    if network_fail and nf_err:
+        print("ERROR: network failure patch incomplete, aborting")
         return 1
 
     if local_save and ls_err:

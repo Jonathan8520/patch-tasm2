@@ -9,10 +9,10 @@ on:
         default: "https://archive.org/download/the_amazing_spider_man_2_v1_3_1_ipa_1.3.1_ios_8.0/The_Amazing_Spider_Man_2_v1_3_1_ipa_1.3.1_ios_8.0.ipa"
       patch_flags:
         description: >-
-          Extra flags for patch_tasm2.py, e.g. --no-persist-chapter.
-          An unknown flag now fails the build instead of being ignored.
-          --no-force-prologue-skip was renamed --no-tutorial-guards; the old
-          name still works. Leave empty for the eight shipped edits.
+          Extra flags for patch_tasm2.py, e.g. --no-persist-chapter or
+          --fail-network. An unknown flag fails the build instead of being
+          ignored. --no-force-prologue-skip was renamed --no-tutorial-guards;
+          the old name still works. Leave empty for the eight shipped edits.
         required: false
         default: ""
       release_tag:
@@ -130,6 +130,9 @@ jobs:
             Eight instructions in the arm64 slice, all derived from the
             disassembly and re-verified on the binary in this IPA. No size
             change, no injected code.
+
+            Extra patch flags for this build: `${{ github.event.inputs.patch_flags }}`
+            (empty means the eight shipped edits and nothing else).
 
             Confirmed on device: a continuous playthrough through the
             prologue, all of chapter 1 and into chapter 2, with the app

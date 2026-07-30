@@ -627,6 +627,72 @@ a JSON file and call it. That route is *not* implemented here, because the
 shipped edits cover the save objects and shipping untested injected code would
 have been worse than shipping nothing.
 
+## The spinner, and why the skills menu waits
+
+Asked why the skills page needs a spinner at all, the answer turned out to be
+that it does not need one — it needs an answer, and offline the only answer it
+gets is a timeout.
+
+`SP_ShowSkillTree` (`0x1003eafe8`) calls `0x1000bf130`. That function asks the
+goods store whether categories 10, 7 and 6 are loaded (three virtual calls
+through `+0x18` at `0x1000bf1bc`, `0x1000bf1d4`, `0x1000bf1ec`), and if any is
+not, raises the shared waiting widget with reason 3:
+
+```
+0x1000bf1f4   adrp x8, 0x101079000 ; ldr x0, [x8, #0x5b0]
+0x1000bf1fc   mov  w1, #3
+0x1000bf200   bl   0x1001e7b94              ; ShowWaiting(reason 3)
+0x1000bf204   bl   0x1000be2e0              ; start the fetch
+0x1000bf21c   bl   0x100346c10              ; is the network reachable?
+0x1000bf220   tbz  w0, #0, 0x1000bf2b8      ;   no  -> state 3
+0x1000bf224   mov  w8, #1                   ;   yes -> state 1
+0x1000bf2bc   str  w8, [x19, #0x88]
+```
+
+The manager's update (`0x1000b1cd0`) dispatches on that state through a jump
+table at `0x1000b28dc` indexed by `state + 5`. State 1 waits for a response.
+State 3 — the offline branch — runs 3 → 4 → −3 with no I/O, and the handlers
+for states −5, −4 and −3 each call `0x1000b1c0c`, which is the **only** code in
+the binary that clears reason 3 (`0x1000b1c50`). Reason 3 is raised at five
+sites and cleared at one; nothing else can take it down.
+
+So the spinner on the skills page is not decoration and not a bug: it is the
+game waiting on a goods fetch that, with the hosts rewritten to `.invalid`,
+can only end in the HTTP layer giving up. That also settles what happened when
+`ShowWaiting` was turned into `ret`: the fetch still ran, the data still never
+came, and the page looked broken because the one indication that it was
+waiting had been removed. The widget was never doing the loading.
+
+The lever is therefore the reachability predicate itself, `0x100346c10`:
+
+```
+0x100346c44   ldrb w8, [x8, #0x2c8]         ; cached answer, 1000 ms
+0x100346c90   sub  w22, w0, #1              ; status 1,2 = wifi, wwan
+0x100346c98   cset w23, lo
+0x100346cc8   strb w8, [x9, #0x2c8]
+0x100346ccc   cmp  w8, #0
+0x100346cd0   cset w0, ne                   ->  mov w0, #0
+```
+
+Fifty call sites, forty-four of which branch on `w0` within three
+instructions; the other six park it in a callee-saved register across an ObjC
+release and branch on it after. The cached byte at `0x10107a2c8` is read and
+written only inside this function, so forcing the result desynchronises
+nothing. The twenty-eight containing functions were identified by the strings
+they reference — login and datacentre selection, shop and IAP, leaderboards,
+friends and mail, analytics, the news/forum/support buttons, the cloud-profile
+upload at `0x10021b770` — and none of them is the local mission server or the
+save/restore path.
+
+Two of them are worth naming. `0x1000ab348` is the main-menu state machine, so
+the main patch (`0x1000ab7b8` `bl` → `mov w0, #0`) is already this predicate,
+forced false at one site; `--fail-network` is the same edit generalised to all
+fifty. And `0x10006f830` is the boot flow, which reads “network available OR
+the profile file existed at startup” and otherwise shows
+`UI_cloud_data_reminder` — whose OK callback (`0x100071108`) sets exactly the
+state the online branch jumped to. One extra dialog on a genuinely first
+launch, none afterwards.
+
 ## Tooling
 
 `tools/` holds the analysis harness used throughout:

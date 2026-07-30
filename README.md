@@ -45,14 +45,13 @@ The Actions tab of somebody else's repository will not run it for you.
   are gone; the game says so with a *“Le réseau actuel est indisponible”*
   dialog, which is honest.
 - **A waiting spinner** sits on screen while a request is pending, and offline
-  some requests never answer, so it can stay. It is genuine feedback, not
-  noise: those pages really are still loading. Removing it was tried
-  (`0x1001e7b94` → `ret`) and **broke the skills menu**, because the function
-  is void but not side-effect-free — it opens with a 185-instruction call that
-  the menus depend on. The edit is kept in the patcher behind `--kill-spinner`,
-  off by default, with the reasoning written up; the promising direction, not
-  attempted, is to disable only the `Waiting.Mask` input blocker at
-  `0x1001e7d80` so the spinner stays and taps pass through.
+  a request is only over when the HTTP layer gives up on a host that no longer
+  resolves. It is genuine feedback, not noise: the page really is still
+  waiting. Deleting it was tried (`0x1001e7b94` → `ret`) and left the skills
+  menu looking broken — not because the widget does any loading, but because
+  it was the only sign that anything was happening. That edit is kept behind
+  `--kill-spinner`, off by default. The right fix is not to hide the wait but
+  to end it: see `--fail-network` below.
 - **The “network unavailable” dialog** still appears now and then. It is
   emitted from 15 separate places, each of which looks the text up and builds
   its own message box through the same helper every other dialog in the game
@@ -192,6 +191,37 @@ Every edit preserves length exactly.
 | pjsmmm-legacy.gameloft.com | legacy backend |
 | ingameads.gameloft.com | ads / iphoneloading.php |
 | 201205igp.gameloft.com | IGP / freemium |
+
+### Opt-in: end the waits — `--fail-network`, `0x100346cd0`
+
+Not in the shipped build yet; it needs a device run first.
+
+`0x100346c10` is the game's reachability predicate — it asks `Reachability`
+for the current status, counts wifi and wwan as reachable, and caches the
+answer for a second. Fifty call sites reach it, and every one of the
+twenty-eight functions containing them is a network feature: login, shop and
+IAP, leaderboards, friends and mail, analytics, the news and support buttons,
+the cloud-profile upload in the save manager. Nothing in the local mission
+server calls it, and nothing on the save/restore path does either.
+
+Its tail is `cmp w8,#0 ; cset w0,ne ; ret`. Replacing the `cset` with
+`mov w0,#0` answers “no network” everywhere, which is a state Gameloft
+shipped a branch for at each of those fifty sites — the same branch the main
+patch above already forces at one of them.
+
+The skills menu is the case that shows why it matters. `SP_ShowSkillTree`
+(`0x1003eafe8`) calls `0x1000bf130`, which raises the spinner when the goods
+categories are not loaded, starts the fetch, then reads the predicate:
+reachable → state 1, *wait for the answer*; unreachable → state 3, the offline
+branch, which the manager's update (`0x1000b1cd0`) runs through 3 → 4 → −3
+without any I/O, and whose handler calls `0x1000b1c0c` — the only code in the
+binary that clears that spinner. Same screen, same widget, same clearing path,
+reached in a frame instead of a timeout.
+
+One visible change beyond the waits: on a genuinely first launch, with no
+profile file yet, the boot flow shows one `UI_cloud_data_reminder` dialog whose
+OK button lands on the state the online branch jumped to. Once the file exists
+— which is what edit 8 above is for — it never appears again.
 
 ### Opting out
 
