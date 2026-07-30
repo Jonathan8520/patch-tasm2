@@ -13,6 +13,15 @@ the prologue, all of chapter 1 and into chapter 2, with the app force-quit
 several times along the way. Settings, trophies, exploration, skills, position,
 tutorial state and the story cursor all survive.
 
+![The home menu offline, reporting 7% of Chapter 2](docs/home-menu-chapter-2.jpg)
+
+That line is the whole project in one sentence. Unpatched and offline, this
+screen never appears — the game hangs on “Downloading profile”. Patched, the
+chapter it reports comes from `ud_OObjects.sav`, the profile document that
+[edit 8](#8-let-the-profile-reach-disk--0x10021163c) finally allowed to be
+written: the local mission server read `"ch2"` back out of it at launch and
+rebuilt the story cursor from the bundled `ch2.json`, with no server involved.
+
 ## Get it
 
 The workflow builds the IPA from the archive.org copy, and running a workflow
@@ -38,6 +47,14 @@ The Actions tab of somebody else's repository will not run it for you.
 | Saves | all 17 save objects persist to `Documents/ud_*.sav` |
 | Profile | the story cursor persists in `ud_OObjects.sav` |
 | Settings, trophies, fog of war, skills, position, tutorial state | all persist |
+
+![Open world, a trophy firing, the map partly uncovered](docs/open-world-trophy.jpg)
+
+Everything in that frame used to travel in the Gameloft profile and is now a
+local file: the trophy that just fired is `ud_Trophy.sav`, the uncovered part
+of the minimap is `ud_FogOfWar.sav`, the spot Spider-Man will respawn at is
+`ud_InitPos.sav`. Twelve of the seventeen save objects were server-persisted
+until [edit 2](#2-make-every-save-object-local--0x10021bc7c) set one byte.
 
 ## What still does not
 
