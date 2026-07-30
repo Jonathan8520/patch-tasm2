@@ -21,7 +21,7 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download the IPA
         run: |
@@ -63,7 +63,7 @@ jobs:
           sha1sum AmazingSpiderMan2.gz
 
       - name: Publish as a Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: analysis-binary
           name: "TASM2 1.3.1 executable (for analysis)"
