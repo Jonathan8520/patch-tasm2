@@ -123,32 +123,24 @@ jobs:
         with:
           tag_name: ${{ github.event.inputs.release_tag }}
           name: "TASM2 patched (${{ github.event.inputs.release_tag }})"
+          # One line per paragraph, deliberately. A release body is rendered
+          # as GFM with hard line breaks on, so every wrap in the source
+          # becomes a <br> on the page and the text arrives as a ragged block.
+          # Markdown files do not behave that way, which is why the README is
+          # wrapped and this is not.
           body: |
-            **The Amazing Spider-Man 2 (1.3.1)** — patched to launch, play and
-            **save** entirely offline, after Gameloft shut down its servers.
+            **The Amazing Spider-Man 2 (1.3.1)** — patched to launch, play and **save** entirely offline, after Gameloft shut down its servers.
 
-            Nine instructions in the arm64 slice, all derived from the
-            disassembly and re-verified on the binary in this IPA. No size
-            change, no injected code.
+            Nine instructions in the arm64 slice, all derived from the disassembly and re-verified on the binary in this IPA. No size change, no injected code.
 
-            Extra patch flags for this build: `${{ github.event.inputs.patch_flags }}`
-            (empty means the nine shipped edits and nothing else).
+            Extra patch flags for this build: `${{ github.event.inputs.patch_flags }}` (empty means the nine shipped edits and nothing else).
 
-            Confirmed on device: a continuous playthrough through the
-            prologue, all of chapter 1 and into chapter 2, with the app
-            force-quit several times. Settings, trophies, exploration,
-            skills, position, tutorial state and the story cursor all
-            survive.
+            Confirmed on device: a continuous playthrough through the prologue, all of chapter 1 and into chapter 2, with the app force-quit several times. Settings, trophies, exploration, skills, position, tutorial state and the story cursor all survive.
 
-            - Signature stripped — re-sign with LiveContainer / SideStore /
-              Sideloadly
-            - **Install fresh rather than over the top**: LiveContainer
-              converts the executable at install time, and replacing a binary
-              inside an installed `.app` produces
-              `cannot dlopen a main executable`
+            - Signature stripped — re-sign with LiveContainer / SideStore / Sideloadly
+            - **Install fresh rather than over the top**: LiveContainer converts the executable at install time, and replacing a binary inside an installed `.app` produces `cannot dlopen a main executable`
             - Built by the `Patch TASM2 IPA` workflow (run #${{ github.run_number }})
 
-            See the README for what works, what does not, and how each edit
-            was arrived at.
+            See the README for what works, what does not, and how each edit was arrived at.
           files: SpiderMan2_patched.ipa
           fail_on_unmatched_files: true
