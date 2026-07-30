@@ -368,3 +368,12 @@ touching any file and fully reversibly. It does not solve saving.
 file format, the full reasoning behind each edit, and the log of everything
 that was tried and did not work, including the two conclusions that device
 data had to overturn.
+
+## Licence
+
+[MIT](LICENSE), and it covers **this repository's own code** — `patch_tasm2.py`,
+`tools/`, the workflow and the documentation. Fork it, change it, ship it.
+
+It does not and cannot cover *The Amazing Spider-Man 2* itself. The game is
+Gameloft's; nothing here is a licence to it. The patcher ships no game code —
+it rewrites nine instructions in a binary you supply yourself.
