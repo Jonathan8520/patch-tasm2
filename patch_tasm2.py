@@ -25,6 +25,11 @@ write, behind a gate that could never unlock itself. One nop opens it, and the
 story then advances offline on its own. Disable with --no-profile-save.
 See LOCAL_SAVE_DESIGN.md.
 
+Boot spinner: the main patch takes the branch that leaves the home menu's
+waiting widget with both of its hides disarmed, so it stayed on screen for
+good. The offline branch now arms them exactly as the online one does.
+Disable with --no-boot-spinner-fix.
+
 Network failure (opt-in, --fail-network): the shared reachability predicate
 returns "unreachable" at all fifty of its call sites, so every request that
 would have hung until its timeout takes the game's own offline branch instead.
@@ -80,6 +85,7 @@ KNOWN_FLAGS = {
     "--no-persist-chapter",
     "--no-tutorial-guards",
     "--no-profile-save",
+    "--no-boot-spinner-fix",
     "--kill-spinner",
     "--fail-network",
     "--verify",
@@ -96,6 +102,7 @@ flags:
   --no-persist-chapter     do not carry the story chapter in ud_QuestManager
   --no-tutorial-guards     let the tutorial bitmask be wiped on restore
   --no-profile-save        leave save object 16 unwritable
+  --no-boot-spinner-fix    leave the home-menu spinner with no way to be hidden
   --kill-spinner           remove the waiting spinner (BREAKS the skills menu)
   --fail-network           report the network as unreachable at all 50 call
                            sites, so every request fails at once instead of
@@ -861,6 +868,86 @@ def verify_network_fail(data):
     return _verify_sites(data, NETWORK_FAIL_SITES)
 
 
+# --- the boot spinner the main patch left standing ---------------------------
+#
+# The waiting widget on the home menu, the one that is still there when you
+# press Start, is not one of the fifty network-gated ones. It is reason 12, and
+# this patcher is why it never goes away.
+#
+# The main-menu state machine shows it once, from a single block:
+#
+#     0x1000ab780   ldrb w9,  [x8, #0xb9]      ; already showing? then skip
+#     0x1000ab788   ldrb w10, [x8, #0xba]
+#     0x1000ab7b0   mov  w20, #1
+#     0x1000ab7b4   strb w20, [x8, #0xba]      ; flag A := "the spinner is up"
+#     0x1000ab7b8   bl   0x100346c10           ; -> mov w0,#0   (the main patch)
+#     0x1000ab7c0   cbz  w0, 0x1000abc1c       ;   offline branch
+#     0x1000ab7c4   strb w20, [x8, #0xbb]      ; flag B := 1, then
+#                                              ;   UI_DOWNLOADING_PROFILE
+#     0x1000abc1c   strb wzr, [x8, #0xbb]      ; flag B := 0, then UI_FIRST_CHECK
+#
+# Both branches then fall into the same `ShowWaiting(12)` at 0x1000abce4 with
+# their own label. So offline the spinner goes up with flag B at zero -- and
+# flag B is what both of its hides are gated on:
+#
+#     0x1000ab600   ldrb w9, [x8, #0xba] ; cbz -> skip      (state machine)
+#     0x1000ab60c   ldrb w9, [x9, #0xbb] ; cbz -> skip
+#     0x1000ab614   strb wzr, [x8, #0xba] ... HideWaiting(12) at 0x1000ab62c
+#
+#     0x1000a8a60   ldrb w9, [x8, #0xba] ; cbz -> skip      (menu destructor)
+#     0x1000a8a68   strb wzr, [x8, #0xba]                   ; clears flag A
+#     0x1000a8a70   ldrb w8, [x8, #0xbb] ; cbz -> skip
+#     0x1000a8a8c   HideWaiting(12)
+#
+# Neither can fire. Worse, the destructor clears flag A on its way past the
+# second test, so once the menu is torn down the widget is orphaned: the show
+# block will not show it again (flag A is 0) and nothing will ever take it
+# down. The only two unconditional `HideWaiting(12)` sites in the binary are
+# 0x1000cea78 and 0x10028fb94, both inside functions with no direct caller --
+# response callbacks that offline never run.
+#
+# The fix is to make the offline branch arm the hide exactly as the online one
+# does: store w20 instead of wzr. `strb w20,[x8,#0xbb]` is the word already at
+# 0x1000ab7c4 (0x3902ed14), the same base register and the same offset, so this
+# writes the instruction the other branch already carries.
+#
+# w20 is 1 with no path in which it is not: `mov w20,#1` at 0x1000ab7b0 is four
+# instructions earlier, and 0x1000ab7c0 is the *only* branch anywhere in __text
+# that lands on 0x1000abc1c.
+#
+# Measured on this binary: the byte at 0x10110b0bb is written at 0x1000ab7c4
+# and 0x1000abc1c and read at 0x1000ab60c and 0x1000a8a70 -- nowhere else. That
+# is from scanning every one of the 952 functions that reference the page for
+# any byte access at 0xb9, 0xba or 0xbb, not from a signature match, because a
+# linear register sweep misses 0x1000abc1c: its ADRP is 0x460 bytes back, on
+# the other side of the branch. Setting the flag can therefore do one thing
+# and one thing only -- let the game's own hide run.
+#
+# On by default: it repairs an invariant the main patch broke. --no-boot-
+# spinner-fix restores the v1.0 behaviour.
+
+# Seven words, not the two it takes to be unique before the edit. The two
+# branches emit the same four instructions -- `strb`, `adrp x8,0x101074000`,
+# `ldr x0,[x8,#0x340]`, `adrp x1,0x100e1d000` -- and both ADRPs sit on the same
+# 4 KiB page, so they encode identically. A shorter signature locates the site
+# correctly and then makes --verify count two patched sites, because the edit
+# turns this block into a copy of the other one. The seventh word is the label:
+# `add x2,x2,#0x917` (UI_FIRST_CHECK) against #0x900 (UI_DOWNLOADING_PROFILE).
+BOOT_SPINNER_SITES = [
+    ("let the offline branch arm the boot spinner's own hide (0x1000abc1c)",
+     bytes.fromhex("1fed0239487e00b000a141f9816b00d0"
+                   "21081f91a26b0090425c2491"), 0, 0x3902ED14),
+]
+
+
+def patch_boot_spinner(m):
+    return _apply_sites(m, BOOT_SPINNER_SITES, "boot spinner")
+
+
+def verify_boot_spinner(data):
+    return _verify_sites(data, BOOT_SPINNER_SITES)
+
+
 # --- an edit that must NOT be there -----------------------------------------
 #
 # 0x1001fc868 cbnz -> b shipped for a while and was removed (see the tutorial
@@ -936,12 +1023,13 @@ def verify_tutorial_guards(data):
 
 
 def patch(data, local_save=True, chapter=True, tutorial_guards=True,
-          profile_save=True, spinner=False, network_fail=False):
+          profile_save=True, boot_spinner=True, spinner=False,
+          network_fail=False):
     """
     Apply the edits and return (patched_bytes, report).
 
-    `report` is a dict rather than a positional tuple: there are ten
-    independent results to carry, and threading an eleventh through a tuple is
+    `report` is a dict rather than a positional tuple: there are eleven
+    independent results to carry, and threading a twelfth through a tuple is
     how a caller ends up silently reading the wrong one.
     """
     m = bytearray(data)
@@ -1040,6 +1128,9 @@ def patch(data, local_save=True, chapter=True, tutorial_guards=True,
     # --- optional: let the local profile object reach disk ---
     ps_sites, ps_err = patch_profile_save(m) if profile_save else ([], None)
 
+    # --- let the home-menu spinner be hidden again ---
+    bs_sites, bs_err = patch_boot_spinner(m) if boot_spinner else ([], None)
+
     # --- optional: never show the network waiting spinner ---
     sp_sites, sp_err = patch_spinner(m) if spinner else ([], None)
 
@@ -1055,6 +1146,7 @@ def patch(data, local_save=True, chapter=True, tutorial_guards=True,
         "chapter": (ch_sites, ch_err),
         "tutorial_guards": (tg_sites, tg_err),
         "profile_save": (ps_sites, ps_err),
+        "boot_spinner": (bs_sites, bs_err),
         "spinner": (sp_sites, sp_err),
         "network_fail": (nf_sites, nf_err),
     }
@@ -1086,6 +1178,7 @@ def main():
     tutorial_guards = not (flags & {"--no-tutorial-guards",
                                     "--no-force-prologue-skip"})
     profile_save = "--no-profile-save" not in flags
+    boot_spinner = "--no-boot-spinner-fix" not in flags
     spinner = "--kill-spinner" in flags
     network_fail = "--fail-network" in flags
 
@@ -1116,6 +1209,9 @@ def main():
         if profile_save and full:
             problems += verify_profile_save(data)
             checked += [label for label, _s, _i, _w in PROFILE_SAVE_SITES]
+        if boot_spinner and full:
+            problems += verify_boot_spinner(data)
+            checked += [label for label, _s, _i, _w in BOOT_SPINNER_SITES]
         if spinner and full:
             problems += verify_spinner(data)
             checked += [label for label, _s, _i, _w in SPINNER_SITES]
@@ -1161,8 +1257,8 @@ def main():
 
     out, report = patch(data, local_save=local_save, chapter=chapter,
                         tutorial_guards=tutorial_guards,
-                        profile_save=profile_save, spinner=spinner,
-                        network_fail=network_fail)
+                        profile_save=profile_save, boot_spinner=boot_spinner,
+                        spinner=spinner, network_fail=network_fail)
     patches = report["strings"]
     jb = report["jb_paths"]
     fn_ok = report["jb_func"]
@@ -1172,7 +1268,20 @@ def main():
     tg_sites, tg_err = report["tutorial_guards"]
     ps_sites, ps_err = report["profile_save"]
     sp_sites, sp_err = report["spinner"]
+    bs_sites, bs_err = report["boot_spinner"]
     nf_sites, nf_err = report["network_fail"]
+
+    if boot_spinner:
+        if bs_err:
+            print(f"\n>>> ERROR: boot spinner fix NOT applied: {bs_err}")
+        else:
+            print("\n>>> BOOT SPINNER patched: the home-menu spinner can be "
+                  "hidden again by the game's own code")
+            for label, off in bs_sites:
+                print(f"    patched   @ file offset {off:<10} {label}")
+    else:
+        print("\n>>> boot spinner fix skipped (--no-boot-spinner-fix): the "
+              "home-menu spinner will stay up for good")
 
     if network_fail:
         if nf_err:
@@ -1301,6 +1410,10 @@ def main():
 
     if spinner and sp_err:
         print("ERROR: spinner patch incomplete, aborting")
+        return 1
+
+    if boot_spinner and bs_err:
+        print("ERROR: boot spinner fix incomplete, aborting")
         return 1
 
     if network_fail and nf_err:

@@ -693,6 +693,54 @@ the profile file existed at startup” and otherwise shows
 state the online branch jumped to. One extra dialog on a genuinely first
 launch, none afterwards.
 
+### The other spinner: the one on the home menu
+
+There are two different problems here, and only one of them is a wait.
+
+The widget on the home menu — still there when you press Start — is reason 12,
+the boot one, and nothing about the network keeps it up. The main-menu state
+machine raises it once:
+
+```
+0x1000ab780   ldrb w9,  [x8, #0xb9]     ; already up? then do nothing
+0x1000ab788   ldrb w10, [x8, #0xba]
+0x1000ab7b0   mov  w20, #1
+0x1000ab7b4   strb w20, [x8, #0xba]     ; flag A := "it is up"
+0x1000ab7b8   bl   0x100346c10          ; -> mov w0,#0, the main patch
+0x1000ab7c0   cbz  w0, 0x1000abc1c
+0x1000ab7c4   strb w20, [x8, #0xbb]     ; flag B := 1, label UI_DOWNLOADING_PROFILE
+0x1000abc1c   strb wzr, [x8, #0xbb]     ; flag B := 0, label UI_FIRST_CHECK
+0x1000abce4   bl   0x1001e7b94          ; both branches: ShowWaiting(12)
+```
+
+Flag B is what both hides are gated on — the state machine's at `0x1000ab60c`
+and the menu destructor's at `0x1000a8a70` — so with the main patch in place
+neither can fire. The destructor is the sharp end: it clears flag A
+(`0x1000a8a68`) *before* testing flag B, so the bookkeeping says the spinner is
+down while the widget is still on screen. The two remaining `HideWaiting(12)`
+sites (`0x1000cea78`, `0x10028fb94`) live in functions with no direct caller —
+response callbacks that offline never run — so nothing else can take it down.
+
+The flag's full usage was established by scanning all 952 functions that
+reference page `0x10110b000` for any byte access at `0xb9`, `0xba` or `0xbb`,
+rather than by a register sweep — a linear sweep misses `0x1000abc1c`, whose
+`ADRP` is `0x460` bytes earlier on the other side of the branch. Two writes
+(`0x1000ab7c4`, `0x1000abc1c`), two reads (`0x1000ab60c`, `0x1000a8a70`), and
+both reads gate a hide. So arming the flag on the offline branch can do
+exactly one thing.
+
+The edit is therefore `strb wzr` → `strb w20` at `0x1000abc1c`: the word
+`0x3902ed14` that the online branch already carries, same base register, same
+offset. `w20` is 1 four instructions earlier, and `0x1000ab7c0` is the only
+branch in `__text` that lands on that address.
+
+It needs a seven-word signature. The two branches emit the same four
+instructions and both `ADRP`s fall on the same 4 KiB page, so they encode
+identically; the edit makes this block a byte-for-byte copy of the other one,
+and a shorter signature would have `--verify` count two patched sites. The
+seventh word is the label that tells them apart: `add x2,x2,#0x917`
+(`UI_FIRST_CHECK`) against `#0x900` (`UI_DOWNLOADING_PROFILE`).
+
 ## Tooling
 
 `tools/` holds the analysis harness used throughout:

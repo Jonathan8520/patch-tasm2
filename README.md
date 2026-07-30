@@ -4,7 +4,7 @@ Gameloft's servers for *The Amazing Spider-Man 2* have been dead since ~2018,
 and the iOS build hangs forever on **“Downloading profile”**. This patches the
 game so it launches, plays **and saves** entirely offline.
 
-Eight instructions, all in the arm64 slice, every one derived from the
+Nine instructions, all in the arm64 slice, every one derived from the
 disassembly and verified on the binary that actually ships. No new save
 format, no injected code, no size change.
 
@@ -46,7 +46,8 @@ The Actions tab of somebody else's repository will not run it for you.
   dialog, which is honest.
 - **A waiting spinner** sits on screen while a request is pending, and offline
   a request is only over when the HTTP layer gives up on a host that no longer
-  resolves. It is genuine feedback, not noise: the page really is still
+  resolves. (The *home-menu* one was a different problem and is fixed — see
+  edit 9.) It is genuine feedback, not noise: the page really is still
   waiting. Deleting it was tried (`0x1001e7b94` → `ret`) and left the skills
   menu looking broken — not because the widget does any loading, but because
   it was the only sign that anything was happening. That edit is kept behind
@@ -178,6 +179,33 @@ enables no new code path — the file simply starts existing.
 > `0x100215920`, so its XXTEA key comes from a device secret rather than from
 > the file's own trailer.
 
+### 9. Give the home-menu spinner a way down — `0x1000abc1c`
+
+Edit 1 has a side effect it took a device report to notice. The main-menu
+state machine raises the boot spinner once, then branches on the predicate:
+the online branch sets a flag at `0x10110b0bb`, the offline branch — the one
+edit 1 forces — clears it. Both then show the same widget with their own
+label.
+
+That flag is what **both** of the spinner's hides are gated on: the state
+machine's (`0x1000ab60c` → `0x1000ab62c`) and the menu destructor's
+(`0x1000a8a70` → `0x1000a8a8c`). With it at zero neither can fire, and the
+destructor clears the *other* flag on its way past, so once the menu is torn
+down nothing can ever take the widget down or put it up again. The only two
+unconditional `HideWaiting(12)` sites in the binary are response callbacks
+with no direct caller, which offline never run.
+
+So the offline branch now stores `w20` where it stored `wzr` — the same
+instruction the online branch already carries, `0x3902ed14`, same register,
+same offset. `w20` is 1 four instructions earlier and `0x1000ab7c0` is the
+only branch in `__text` that lands here.
+
+The flag is written in exactly two places and read in exactly two, both of
+them these hides — established by scanning all 952 functions that reference
+that page for any byte access at `0xb9`, `0xba` or `0xbb`, because a linear
+register sweep misses this site: its `ADRP` is `0x460` bytes back, on the far
+side of the branch.
+
 ### Complementary edits
 
 Dead Gameloft hostnames are rewritten to `.invalid` (RFC 6761: never
@@ -226,12 +254,13 @@ OK button lands on the state the online branch jumped to. Once the file exists
 ### Opting out
 
 `--no-local-save`, `--no-persist-chapter`, `--no-tutorial-guards`,
-`--no-profile-save`. An unknown flag is an error rather than a silent no-op, so
-a typo cannot quietly drop an edit; `--no-force-prologue-skip` still works as
-the former name of `--no-tutorial-guards`.
+`--no-profile-save`, `--no-boot-spinner-fix`. An unknown flag is an error
+rather than a silent no-op, so a typo cannot quietly drop an edit;
+`--no-force-prologue-skip` still works as the former name of
+`--no-tutorial-guards`.
 
 The patcher writes nothing if a site is missing or ambiguous, and
-`patch_tasm2.py --verify <binary>` re-checks the binary that ships: all eight
+`patch_tasm2.py --verify <binary>` re-checks the binary that ships: all nine
 edits — the main patch included — plus the jailbreak edit, plus that no live
 Gameloft host survived, plus that the removed prologue-skip edit is **absent**,
 so a binary built by an older patcher cannot pass. The build workflow runs it
