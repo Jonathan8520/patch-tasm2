@@ -741,6 +741,47 @@ and a shorter signature would have `--verify` count two patched sites. The
 seventh word is the label that tells them apart: `add x2,x2,#0x917`
 (`UI_FIRST_CHECK`) against `#0x900` (`UI_DOWNLOADING_PROFILE`).
 
+### And when the mask still will not reach zero
+
+Device photo, after both of the above: the home menu is fully loaded — chapter
+2, the Play button, everything — and the widget is still turning at the bottom
+of the screen, with the events button reading `--:--:--:--`. Its data never
+arrived, and its bit was never cleared.
+
+That is the general shape of the problem rather than a bug in a particular
+screen. There is one widget for the whole game and it is visible while *any*
+bit of the mask at `+0x330` is set. Counting raises against clears per reason:
+reason 0 has 47 raises and 36 clears, reason 3 five and one, reason 12 two and
+four. Offline, a raise whose clear lives in a response handler is a bit that
+stays set for the rest of the session, and every screen opened afterwards
+inherits the widget.
+
+Edit 9 covers the one case this patcher caused. `--fail-network` shortens the
+waits that are real waits. Neither can promise the mask empties, because that
+would need all 65 raise sites to be matched offline in code written on the
+assumption that a server answers.
+
+So `--kill-spinner` now stops the widget being displayed rather than trying to
+balance the mask — and, unlike the first attempt, it keeps the mask itself:
+
+```
+0x1001e7bb8   ldr w9, [x19, #0x330]
+0x1001e7bc0   str w0, [x19, #0x330]      ; mask |= 1<<reason, as always
+0x1001e7bc4   bl  0x1001e78b0     ->     b 0x1001e7f28     ; ShowWaiting's epilogue
+```
+
+The first attempt made `0x1001e7b94` `ret` at its first instruction, which also
+skipped the mask update, so the two halves of the pair no longer agreed. The
+jump instead lands past the two stack destructors at `0x1001e7f18` and
+`0x1001e7f20` — right, since their objects were never constructed on this path
+— and on the `ldp`/`add sp`/`ret` that undo a prologue which has already run.
+
+Inside the skipped body the manager is written in exactly two places,
+`+0x31d` (`0x1001e7e88`) and `+0x10` (`0x1001e7ef8`), both "the widget is on
+screen" flags. Left at zero, `HideWaiting`'s last branch (`0x1001e7fa0`) finds
+nothing to hide and the shop's hide-everything helper (`0x1000b1c28`) returns
+early. Both are correct: nothing is shown.
+
 ## Tooling
 
 `tools/` holds the analysis harness used throughout:

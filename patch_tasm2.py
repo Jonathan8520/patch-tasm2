@@ -103,7 +103,8 @@ flags:
   --no-tutorial-guards     let the tutorial bitmask be wiped on restore
   --no-profile-save        leave save object 16 unwritable
   --no-boot-spinner-fix    leave the home-menu spinner with no way to be hidden
-  --kill-spinner           remove the waiting spinner (BREAKS the skills menu)
+  --kill-spinner           never display the waiting widget (use together with
+                           --fail-network, or pages give no sign of loading)
   --fail-network           report the network as unreachable at all 50 call
                            sites, so every request fails at once instead of
                            waiting for a timeout (not yet device-tested)
@@ -744,42 +745,57 @@ def verify_profile_save(data):
     return _verify_sites(data, PROFILE_SAVE_SITES)
 
 
-# --- the waiting spinner: TRIED, HARMFUL, OFF BY DEFAULT ---------------------
+# --- the waiting widget itself ----------------------------------------------
 #
-# The spinner can sit on screen forever offline -- home menu, skills page, and
-# worst in the shop after a failed purchase. It is driven by a mask of reasons
-# at progressMgr+0x330: 0x1001e7b94 sets bit N and shows the widget,
-# 0x1001e7f3c clears bit N and hides it once the mask reaches 0. Some requests
-# never answer offline, so their bit is never cleared.
+# One widget, one mask, and it is on screen while any bit of that mask is set:
 #
-# Turning 0x1001e7b94 into `ret` removes the spinner -- and breaks the menus.
-# Device report: the skills page no longer loads its content at all.
+#     0x1001e7b94  ShowWaiting(mgr, reason)   mask |= 1<<reason, then display
+#     0x1001e7f3c  HideWaiting(mgr, reason)   mask &= ~(1<<reason), and hide
+#                                             only once the mask reaches 0
 #
-# The reasoning that shipped it was wrong in a specific, instructive way. It
-# checked the *calling convention* -- the function returns nothing meaningful
-# and several callers reach it by `b`, so no caller is left holding a bogus
-# value -- and concluded "safe to skip". That is a proof about the return
-# value, not about the body. The body opens with
+# Sixty-five call sites raise it and the reasons are not symmetric: reason 0
+# alone has 47 raises against 36 clears, and reason 3 -- the skills and shop
+# one -- has five raises and exactly one clear, at 0x1000b1c50. So a single
+# request that never comes back keeps the widget up over every screen you then
+# open, which is why it appeared to be "the skills menu's spinner" and, in the
+# device photo, the home menu's.
 #
-#     0x1001e7bc4   bl 0x1001e78b0
+# Edit 9 fixes the one case that was ours to fix (reason 12, the boot spinner)
+# and --fail-network shortens the waits that are genuinely waits. Neither can
+# promise the mask reaches 0, because that needs every raise offline to be
+# matched by a clear, at 65 sites, in code paths that assume a server answers.
 #
-# a 185-instruction routine that touches the managers at 0x1010740c0,
-# 0x101074100 and 0x101074210. Whatever that does, the menus need it. "Void" is
-# not the same as "no side effects", and the spinner was carrying real
-# information: those pages genuinely are still loading.
+# This edit stops the widget being displayed at all, and it is deliberately not
+# the one that was tried first. That one made 0x1001e7b94 `ret` at its first
+# instruction, which also skipped `mask |= 1<<reason`, so ShowWaiting and
+# HideWaiting no longer agreed on what was up. Here the mask is still
+# maintained and only the display is skipped:
 #
-# Kept here because the analysis is sound and the site is right, should anyone
-# want to work on the widget rather than delete it -- the promising direction
-# is the mask, not the spinner: 0x1001e7d80 (`ldr w8,[x19,#0x32c]; cbz w8`)
-# guards the "Waiting.Mask" input blocker separately from the spinner itself,
-# so the feedback could stay while taps pass through. Not attempted.
+#     0x1001e7bb8  ldr w9, [x19, #0x330]
+#     0x1001e7bc0  str w0, [x19, #0x330]     ; mask updated, as always
+#     0x1001e7bc4  bl  0x1001e78b0           ->  b 0x1001e7f28   (the epilogue)
 #
-# --kill-spinner enables it. Do not, unless you are re-testing this.
+# The jump lands after the two stack destructors at 0x1001e7f18/0x1001e7f20 --
+# correct, since their objects are never constructed on this path -- and on the
+# `ldp`/`add sp`/`ret` that undo the prologue, which has already run. x19..x22
+# are restored by it; only x19, x20 and x21 are touched before the jump.
+#
+# The body writes exactly two fields of the manager, both of them "the widget is
+# on screen" bookkeeping: +0x31d (0x1001e7e88) and +0x10 (0x1001e7ef8). Left at
+# zero, HideWaiting's final branch (0x1001e7fa0) finds nothing to hide and the
+# shop's hide-everything helper (0x1000b1c28) returns early -- both correct,
+# because nothing is shown. No other field is touched, so nothing else can go
+# out of step.
+#
+# The trade is real and it is the user's to make: the widget is the only signal
+# that a page is still loading. With --fail-network the pages that used to wait
+# now fail in a frame, which is what makes removing it reasonable rather than
+# merely quieter. Both flags, or neither.
 
 SPINNER_SITES = [
-    ("never show the network waiting spinner (0x1001e7b94) -- BREAKS MENUS",
-     bytes.fromhex("ffc304d1f65710a9f44f11a9fd7b12a9fd830491f30300aa14d0bf12"),
-     0, 0xD65F03C0),   # ret
+    ("never put the waiting widget on screen (0x1001e7bc4)",
+     bytes.fromhex("a822c11a693243b92001082a603203b93bffff97"),
+     4, 0x140000D9),   # b 0x1001e7f28 -- ShowWaiting's own epilogue
 ]
 
 
@@ -1299,12 +1315,15 @@ def main():
         if sp_err:
             print(f"\n>>> ERROR: spinner patch NOT applied: {sp_err}")
         else:
-            print("\n>>> SPINNER patched: never shown -- WARNING, this breaks "
-                  "the skills menu; see the comment in this file")
+            print("\n>>> SPINNER patched: the waiting widget is never "
+                  "displayed (the mask behind it is still maintained)")
             for label, off in sp_sites:
                 print(f"    patched   @ file offset {off:<10} {label}")
     else:
         print("\n>>> spinner left in place (it is load feedback, not noise)")
+    if spinner and not network_fail:
+        print("    WARNING: --kill-spinner without --fail-network removes the "
+              "only sign that a page is still waiting")
 
     if profile_save:
         if ps_err:

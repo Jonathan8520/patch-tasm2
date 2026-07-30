@@ -44,15 +44,15 @@ The Actions tab of somebody else's repository will not run it for you.
 - **Anything genuinely online**: shop purchases, events, friends. The servers
   are gone; the game says so with a *“Le réseau actuel est indisponible”*
   dialog, which is honest.
-- **A waiting spinner** sits on screen while a request is pending, and offline
-  a request is only over when the HTTP layer gives up on a host that no longer
-  resolves. (The *home-menu* one was a different problem and is fixed — see
-  edit 9.) It is genuine feedback, not noise: the page really is still
-  waiting. Deleting it was tried (`0x1001e7b94` → `ret`) and left the skills
-  menu looking broken — not because the widget does any loading, but because
-  it was the only sign that anything was happening. That edit is kept behind
-  `--kill-spinner`, off by default. The right fix is not to hide the wait but
-  to end it: see `--fail-network` below.
+- **A waiting spinner** can sit on screen while a request is pending. There is
+  one widget for the whole game, shown while any bit of a mask is set, and the
+  raises are not matched by clears offline: reason 0 has 47 raises against 36
+  clears, reason 3 has five raises and a single clear. One request that never
+  answers keeps it up over every screen you open next — which is why it looks
+  like the skills menu's spinner, or the home menu's. Edit 9 fixes the one case
+  that was ours to cause; `--fail-network` shortens the waits that really are
+  waits; `--kill-spinner` stops the widget being displayed at all. See both
+  below.
 - **The “network unavailable” dialog** still appears now and then. It is
   emitted from 15 separate places, each of which looks the text up and builds
   its own message box through the same helper every other dialog in the game
@@ -250,6 +250,30 @@ One visible change beyond the waits: on a genuinely first launch, with no
 profile file yet, the boot flow shows one `UI_cloud_data_reminder` dialog whose
 OK button lands on the state the online branch jumped to. Once the file exists
 — which is what edit 8 above is for — it never appears again.
+
+### Opt-in: remove the widget — `--kill-spinner`, `0x1001e7bc4`
+
+Also not shipped by default, and meant to be used *with* `--fail-network`.
+
+`ShowWaiting` sets its bit and then displays the widget. This jumps from just
+after the mask update straight to the function's own epilogue, so the mask is
+still maintained and only the display is skipped:
+
+```
+0x1001e7bc0   str w0, [x19, #0x330]     ; mask |= 1<<reason, as always
+0x1001e7bc4   bl  0x1001e78b0    ->     b 0x1001e7f28    ; the epilogue
+```
+
+Deliberately not the first thing tried, which was `ret` at `0x1001e7b94` — that
+skipped the mask update too, leaving `ShowWaiting` and `HideWaiting` disagreeing
+about what was on screen. The body writes exactly two manager fields, `+0x31d`
+and `+0x10`, both of them “the widget is visible” bookkeeping; left at zero,
+`HideWaiting` finds nothing to hide and the shop's hide-everything helper
+returns early. Both correct, because nothing is shown.
+
+The trade is real: the widget is the only signal that a page is still loading.
+That is why it pairs with `--fail-network`, which makes the pages that used to
+wait fail in a frame instead.
 
 ### Opting out
 
