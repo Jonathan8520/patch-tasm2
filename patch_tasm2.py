@@ -72,7 +72,7 @@ JB_PATHS = [
 # anything is written, and the offset is now checked to fall inside the arm64
 # __text section first, which the raw offset never was.
 #
-# Unlike the other eight edits this one is complementary rather than
+# Unlike the other nine edits this one is complementary rather than
 # load-bearing: without it the game still launches, plays and saves, so a
 # mismatch warns instead of aborting.
 JB_FUNC_FILEOFF = 19016508

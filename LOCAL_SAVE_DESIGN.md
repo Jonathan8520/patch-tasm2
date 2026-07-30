@@ -1,7 +1,7 @@
 # Local save — the reasoning, and everything that was tried
 
 Status: **done and confirmed on device.** This file is the map of the save
-subsystem and the record of how the eight shipped edits were arrived at,
+subsystem and the record of how the nine shipped edits were arrived at,
 including the false trails, because they are the expensive part.
 
 All addresses are virtual addresses in the arm64 slice, linked at

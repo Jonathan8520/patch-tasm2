@@ -12,7 +12,7 @@ on:
           Extra flags for patch_tasm2.py, e.g. --no-persist-chapter or
           --fail-network. An unknown flag fails the build instead of being
           ignored. --no-force-prologue-skip was renamed --no-tutorial-guards;
-          the old name still works. Leave empty for the eight shipped edits.
+          the old name still works. Leave empty for the nine shipped edits.
         required: false
         default: ""
       release_tag:
@@ -132,7 +132,7 @@ jobs:
             change, no injected code.
 
             Extra patch flags for this build: `${{ github.event.inputs.patch_flags }}`
-            (empty means the eight shipped edits and nothing else).
+            (empty means the nine shipped edits and nothing else).
 
             Confirmed on device: a continuous playthrough through the
             prologue, all of chapter 1 and into chapter 2, with the app
